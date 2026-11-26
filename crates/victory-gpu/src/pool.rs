@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
@@ -32,6 +32,8 @@ const BLOCK: u64 = 64 << 20;
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.
 const SPARE_KEPT: usize = 64;
+/// Cap on kept empty texture blocks on `low_end_vram()` (4 * 64 MiB = 256 MiB).
+const SPARE_KEPT_LOW: usize = 4;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
@@ -56,6 +58,8 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
             0
         } else if pressure {
             1
+        } else if crate::residency::low_end_ram() {
+            limit.min(2)
         } else {
             limit
         };
@@ -64,8 +68,14 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    spares_for(memory, keep, crate::residency::low_end_vram())
+}
+
+fn spares_for(memory: Option<[u64; 4]>, keep: bool, low_end_vram: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
+            if low_end_vram { SPARE_KEPT_LOW } else { SPARE_KEPT }
+        }
         _ => SPARE,
     }
 }
@@ -97,8 +107,39 @@ pub(crate) fn on() -> bool {
 /// every submission begun before its making has left behind ([`Ripe`]) has
 /// no such lists: pieces are cut from those first.
 fn ahead() -> usize {
-    static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let explicit = *OVERRIDE.get_or_init(|| {
+        std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok())
+    });
+    if let Some(n) = explicit {
+        return n;
+    }
+    const EIGHT_GIB: u64 = 8 << 30;
+    const TWELVE_GIB: u64 = 12 << 30;
+    if crate::residency::low_end_override() == Some(true) {
+        return 2;
+    }
+    if crate::residency::low_end_override() == Some(false) {
+        return 12;
+    }
+    static BUDGET: AtomicU64 = AtomicU64::new(0);
+    let mut budget = BUDGET.load(Ordering::Relaxed);
+    if budget == 0
+        && let Some([b, ..]) = crate::host::host().and_then(|h| h.video_memory())
+        && b > 0
+    {
+        BUDGET.store(b, Ordering::Relaxed);
+        budget = b;
+    }
+    if budget > 0 && budget <= EIGHT_GIB {
+        2
+    } else if budget > 0 && budget <= TWELVE_GIB {
+        4
+    } else if crate::residency::low_end_vram() {
+        2
+    } else {
+        12
+    }
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how
@@ -377,6 +418,90 @@ impl Drop for StagingPiece {
     }
 }
 
+/// Opt-in switch for using `D3D12_HEAP_TYPE_GPU_UPLOAD` (ReBAR / AMD SAM)
+/// for pooled staging blocks (`VICTORY_GPU_UPLOAD_HEAP=1`; default `"0"`).
+fn gpu_upload_heap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_UPLOAD_HEAP").is_some_and(|v| v == "1"))
+}
+
+/// Fail-safe latch for `D3D12_HEAP_TYPE_GPU_UPLOAD` staging allocations:
+/// cleared immediately to `false` on any driver error so subsequent
+/// allocations go straight to `D3D12_HEAP_TYPE_UPLOAD`.
+static GPU_UPLOAD_HEAP_USABLE: AtomicBool = AtomicBool::new(true);
+
+fn should_try_gpu_upload_heap(enabled: bool, supported: bool, usable: &AtomicBool) -> bool {
+    enabled && supported && usable.load(Ordering::Relaxed)
+}
+
+fn create_gpu_upload_buffer(
+    host: &crate::host::Host,
+    size: u64,
+) -> windows::core::Result<(ID3D12Resource, *mut u8)> {
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size.max(1),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: plain creation and mapping of a GPU upload staging buffer.
+    unsafe {
+        host.device.CreateCommittedResource(
+            &heap,
+            crate::host::not_resident(),
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )?;
+        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+        crate::host::resident(&host.device, b)?;
+        crate::host::mapped(&host.device)?;
+        b.Map(0, None, Some(&mut data))?;
+    }
+    Ok((buffer.ok_or_else(windows::core::Error::empty)?, data.cast()))
+}
+
+fn allocate_staging_block(host: &crate::host::Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if should_try_gpu_upload_heap(
+        gpu_upload_heap_enabled(),
+        host.gpu_upload_heap_supported(),
+        &GPU_UPLOAD_HEAP_USABLE,
+    ) {
+        match create_gpu_upload_buffer(host, size) {
+            Ok((buffer, data)) => {
+                crate::host::MADE[0].fetch_add(1, Ordering::Relaxed);
+                crate::host::MADE[1].fetch_add(size, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::book::made(&buffer, || "a GPU upload staging buffer".into());
+                return Some((buffer, data));
+            }
+            Err(e) => {
+                GPU_UPLOAD_HEAP_USABLE.store(false, Ordering::Relaxed);
+                tracing::warn!(
+                    error = %e,
+                    size,
+                    "D3D12_HEAP_TYPE_GPU_UPLOAD staging allocation failed; latching fallback to D3D12_HEAP_TYPE_UPLOAD"
+                );
+            }
+        }
+    }
+    host.upload_buffer(size)
+}
+
 /// `bytes` of upload memory, all zeros: the buffer it lies in, where in
 /// that buffer, and its mapping. `None`: not pooled.
 pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
@@ -393,7 +518,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         if speculative && !crate::residency::allow_staging_growth(false) {
             return None;
         }
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
+        let (buffer, data) = allocate_staging_block(host, BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     })?;
@@ -467,8 +592,11 @@ fn small_placement() -> bool {
     if let Some(on) = crate::ab::pick("VICTORY_POOL_SMALL") {
         return on;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_SMALL").is_some_and(|v| v != "0"))
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let explicit = *OVERRIDE.get_or_init(|| {
+        std::env::var_os("VICTORY_POOL_SMALL").map(|v| v != "0")
+    });
+    explicit.unwrap_or_else(crate::residency::low_end_vram)
 }
 
 /// Textures made in the last second ([`fresh`]), and when.
@@ -506,6 +634,10 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
     }
 }
 
+/// Whether the host driver / OS supports `D3D12_HEAP_FLAG_CREATE_NOT_ZEROED`
+/// (Windows 10 2004+ / Windows 11). Cleared automatically on `E_INVALIDARG`.
+static CREATE_NOT_ZEROED_SUPPORTED: AtomicBool = AtomicBool::new(true);
+
 /// A texture of `desc` (no target, depth or unordered access) in a block;
 /// `None`: not pooled, or the host refused.
 ///
@@ -536,15 +668,29 @@ pub(crate) unsafe fn texture(
     }
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
-        let desc = D3D12_HEAP_DESC {
+        const E_INVALIDARG: HRESULT = HRESULT(0x8007_0057_u32 as i32);
+        let base_flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident();
+        let try_not_zeroed = CREATE_NOT_ZEROED_SUPPORTED.load(Ordering::Relaxed);
+        let mut desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             Alignment: 0,
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+            Flags: if try_not_zeroed { base_flags | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED } else { base_flags },
         };
         let mut heap: Option<ID3D12Heap> = None;
         // SAFETY: plain creation.
-        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+        let mut result = unsafe { device.CreateHeap(&desc, &mut heap) };
+        if let Err(ref e) = result
+            && try_not_zeroed
+            && e.code() == E_INVALIDARG
+        {
+            CREATE_NOT_ZEROED_SUPPORTED.store(false, Ordering::Relaxed);
+            desc.Flags = base_flags;
+            heap = None;
+            // SAFETY: plain creation without `D3D12_HEAP_FLAG_CREATE_NOT_ZEROED`.
+            result = unsafe { device.CreateHeap(&desc, &mut heap) };
+        }
+        if let Err(e) = result {
             crate::residency::allocation_error(&e);
             tracing::warn!(error = %e, "no block of texture memory");
         }
@@ -612,10 +758,12 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
-        assert_eq!(spares(None, true), SPARE);
+        assert_eq!(spares_for(Some([100, 84, 0, 0]), true, false), SPARE_KEPT);
+        assert_eq!(spares_for(Some([100, 84, 0, 0]), true, true), SPARE_KEPT_LOW);
+        assert_eq!(spares_for(Some([100, 85, 0, 0]), true, false), SPARE);
+        assert_eq!(spares_for(Some([100, 85, 0, 0]), true, true), SPARE);
+        assert_eq!(spares_for(Some([100, 10, 0, 0]), false, false), SPARE);
+        assert_eq!(spares_for(None, true, false), SPARE);
     }
 
     #[test]
@@ -758,5 +906,15 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn gpu_upload_heap_opt_in_and_fallback_latch() {
+        let latch = AtomicBool::new(true);
+        assert!(!should_try_gpu_upload_heap(false, true, &latch));
+        assert!(!should_try_gpu_upload_heap(true, false, &latch));
+        assert!(should_try_gpu_upload_heap(true, true, &latch));
+        latch.store(false, Ordering::Relaxed);
+        assert!(!should_try_gpu_upload_heap(true, true, &latch));
     }
 }

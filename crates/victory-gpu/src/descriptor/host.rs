@@ -120,6 +120,372 @@ struct RawPageRun {
     populated: u32,
 }
 
+/// Associative run-length monoid node summarizing contiguous free (0-bit)
+/// slots over a segment of [`DynamicBits`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RunSummary {
+    prefix: u32,
+    suffix: u32,
+    max_run: u32,
+    len: u32,
+}
+
+impl RunSummary {
+    const EMPTY: Self = Self { prefix: 0, suffix: 0, max_run: 0, len: 0 };
+
+    #[inline]
+    fn full_free(len: u32) -> Self {
+        Self { prefix: len, suffix: len, max_run: len, len }
+    }
+
+    #[inline]
+    fn merge(a: Self, b: Self) -> Self {
+        let prefix = if a.prefix == a.len { a.len + b.prefix } else { a.prefix };
+        let suffix = if b.suffix == b.len { b.len + a.suffix } else { b.suffix };
+        let max_run = a.max_run.max(b.max_run).max(a.suffix + b.prefix);
+        Self { prefix, suffix, max_run, len: a.len + b.len }
+    }
+
+    /// Computes the free-run summary of a 64-bit taken-bitset leaf word,
+    /// clamping to `valid_bits` (`<= 64`) in the final partial word.
+    #[inline]
+    fn from_word(word: u64, valid_bits: u32) -> Self {
+        if valid_bits == 0 {
+            return Self::EMPTY;
+        }
+        // Mark out-of-range high bits as taken (1) so they never join a free run.
+        let masked = if valid_bits == 64 { word } else { word | (!0u64 << valid_bits) };
+        if masked == !0u64 {
+            return Self { prefix: 0, suffix: 0, max_run: 0, len: valid_bits };
+        }
+        let prefix = masked.trailing_zeros();
+        if prefix == valid_bits {
+            return Self::full_free(valid_bits);
+        }
+        let shifted = masked << (64 - valid_bits);
+        let suffix = shifted.leading_zeros();
+        let mut free = !masked;
+        let mut max_run = 0u32;
+        while free != 0 {
+            let shift = free.trailing_zeros();
+            free >>= shift;
+            let run = free.trailing_ones();
+            if run > max_run {
+                max_run = run;
+            }
+            if run == 64 {
+                break;
+            }
+            free >>= run;
+        }
+        Self { prefix, suffix, max_run, len: valid_bits }
+    }
+}
+
+/// Packed bitset of taken dynamic descriptor slots augmented with a flat
+/// binary Monoid Run-Length Summary Tree (`H-RLA`) over its 64-bit leaf words:
+/// O(1) `max_free_run` / rejection and O(log(N / 64)) updates and descent.
+struct DynamicBits {
+    words: Vec<u64>,
+    tree: Vec<RunSummary>,
+    leaf_base: usize,
+    len: usize,
+}
+
+impl DynamicBits {
+    fn new(len: usize) -> Self {
+        let num_words = len.div_ceil(64);
+        let words = vec![0; num_words];
+        if num_words == 0 {
+            return Self { words, tree: Vec::new(), leaf_base: 0, len };
+        }
+        let leaf_base = num_words.next_power_of_two();
+        let mut tree = vec![RunSummary::EMPTY; leaf_base * 2];
+        for w in 0..num_words {
+            let valid = (len - w * 64).min(64) as u32;
+            tree[leaf_base + w] = RunSummary::full_free(valid);
+        }
+        for idx in (1..leaf_base).rev() {
+            tree[idx] = RunSummary::merge(tree[idx * 2], tree[idx * 2 + 1]);
+        }
+        Self { words, tree, leaf_base, len }
+    }
+
+    #[inline]
+    fn word_valid_bits(&self, w: usize) -> u32 {
+        (self.len - w * 64).min(64) as u32
+    }
+
+    /// Longest contiguous run of free slots anywhere in the bitset, in O(1).
+    #[inline]
+    fn max_free_run(&self) -> usize {
+        if self.len == 0 { 0 } else { self.tree[1].max_run as usize }
+    }
+
+    fn update_word(&mut self, w: usize) {
+        let mut idx = self.leaf_base + w;
+        self.tree[idx] = RunSummary::from_word(self.words[w], self.word_valid_bits(w));
+        idx >>= 1;
+        while idx >= 1 {
+            let merged = RunSummary::merge(self.tree[idx * 2], self.tree[idx * 2 + 1]);
+            if self.tree[idx] == merged {
+                break;
+            }
+            self.tree[idx] = merged;
+            idx >>= 1;
+        }
+    }
+
+    fn update_word_range(&mut self, first_w: usize, last_w: usize) {
+        if first_w == last_w {
+            self.update_word(first_w);
+            return;
+        }
+        for w in first_w..=last_w {
+            self.tree[self.leaf_base + w] =
+                RunSummary::from_word(self.words[w], self.word_valid_bits(w));
+        }
+        let mut lo = (self.leaf_base + first_w) >> 1;
+        let mut hi = (self.leaf_base + last_w) >> 1;
+        while lo >= 1 {
+            for idx in lo..=hi {
+                self.tree[idx] = RunSummary::merge(self.tree[idx * 2], self.tree[idx * 2 + 1]);
+            }
+            lo >>= 1;
+            hi >>= 1;
+        }
+    }
+
+    /// Index of the first set bit in `[start, end)`, or `None` if all are 0.
+    fn first_taken(&self, start: usize, end: usize) -> Option<usize> {
+        let mut at = start;
+        while at < end {
+            let w = at / 64;
+            let b = at % 64;
+            let bits = (end - at).min(64 - b);
+            let mask = if bits == 64 { !0u64 } else { ((1u64 << bits) - 1) << b };
+            let hit = self.words[w] & mask;
+            if hit != 0 {
+                return Some(w * 64 + hit.trailing_zeros() as usize);
+            }
+            at += bits;
+        }
+        None
+    }
+
+    /// Single-path O(log(N / 64)) descent into a subtree fully contained in
+    /// the query range whose `max_run >= n`, returning the earliest run start.
+    fn descend_full(&self, mut idx: usize, mut w_lo: usize, mut w_hi: usize, n: usize) -> usize {
+        while w_hi - w_lo > 1 {
+            let mid_w = w_lo + (w_hi - w_lo) / 2;
+            let left = self.tree[idx * 2];
+            if left.max_run as usize >= n {
+                idx *= 2;
+                w_hi = mid_w;
+            } else {
+                let right = self.tree[idx * 2 + 1];
+                if left.suffix as usize + right.prefix as usize >= n {
+                    return mid_w * 64 - left.suffix as usize;
+                }
+                idx = idx * 2 + 1;
+                w_lo = mid_w;
+            }
+        }
+        let valid = self.word_valid_bits(w_lo) as usize;
+        let mask = if valid == 64 { !0u64 } else { (1u64 << valid) - 1 };
+        let mut free = (!self.words[w_lo]) & mask;
+        let mut pos = 0usize;
+        while free != 0 {
+            let skip = free.trailing_zeros() as usize;
+            pos += skip;
+            free >>= skip;
+            let run = free.trailing_ones() as usize;
+            if run >= n {
+                return w_lo * 64 + pos;
+            }
+            if run == 64 {
+                break;
+            }
+            pos += run;
+            free >>= run;
+        }
+        unreachable!("H-RLA summary guaranteed a free run of length {n} in word {w_lo}")
+    }
+
+    /// Visits O(log(N / 64)) segment-tree nodes covering `range = (start, limit)`
+    /// while carrying the trailing free-run length immediately before each node.
+    fn find_in_node(
+        &self,
+        idx: usize,
+        words: (usize, usize),
+        range: (usize, usize),
+        n: usize,
+        carry: &mut usize,
+    ) -> Option<usize> {
+        let (w_lo, w_hi) = words;
+        let (start, limit) = range;
+        let s = self.tree[idx];
+        let node_lo = w_lo * 64;
+        let node_hi = node_lo + s.len as usize;
+        if s.len == 0 || node_hi <= start || node_lo >= limit {
+            return None;
+        }
+        if start <= node_lo && node_hi <= limit {
+            if *carry + s.prefix as usize >= n {
+                return Some(node_lo - *carry);
+            }
+            if s.max_run as usize >= n {
+                return Some(self.descend_full(idx, w_lo, w_hi, n));
+            }
+            if s.suffix == s.len {
+                *carry += s.len as usize;
+            } else {
+                *carry = s.suffix as usize;
+            }
+            return None;
+        }
+        if w_hi - w_lo == 1 {
+            let lo = start.max(node_lo);
+            let hi = limit.min(node_hi);
+            let b = lo - node_lo;
+            let avail = hi - lo;
+            let word = self.words[w_lo];
+            let leading_free = ((word >> b).trailing_zeros() as usize).min(avail);
+            if *carry + leading_free >= n {
+                return Some(lo - *carry);
+            }
+            if leading_free == avail {
+                *carry += avail;
+                return None;
+            }
+            let mask = if avail == 64 { !0u64 } else { (1u64 << avail) - 1 };
+            let mut free = (!(word >> b)) & mask;
+            let mut pos = 0usize;
+            while free != 0 {
+                let skip = free.trailing_zeros() as usize;
+                pos += skip;
+                free >>= skip;
+                let run = free.trailing_ones() as usize;
+                if run >= n {
+                    return Some(lo + pos);
+                }
+                if run == 64 {
+                    break;
+                }
+                pos += run;
+                free >>= run;
+            }
+            let shifted = (word >> b) << (64 - avail);
+            *carry = (shifted.leading_zeros() as usize).min(avail);
+            return None;
+        }
+        let mid_w = w_lo + (w_hi - w_lo) / 2;
+        if let Some(hit) = self.find_in_node(idx * 2, (w_lo, mid_w), range, n, carry) {
+            return Some(hit);
+        }
+        self.find_in_node(idx * 2 + 1, (mid_w, w_hi), range, n, carry)
+    }
+
+    fn find_in(&self, start: usize, limit: usize, n: usize) -> Option<usize> {
+        let limit = limit.min(self.len);
+        if n == 0 || limit.saturating_sub(start) < n || self.max_free_run() < n {
+            return None;
+        }
+        let mut carry = 0usize;
+        self.find_in_node(1, (0, self.leaf_base), (start, limit), n, &mut carry)
+    }
+
+    fn find_run(&self, cursor: usize, n: usize) -> Option<usize> {
+        if n == 0 || n > self.len || self.max_free_run() < n {
+            return None;
+        }
+        if cursor <= self.len - n && self.first_taken(cursor, cursor + n).is_none() {
+            return Some(cursor);
+        }
+        if let Some(at) = self.find_in(cursor, self.len, n) {
+            return Some(at);
+        }
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(self.len);
+        self.find_in(0, second_end, n)
+    }
+
+    fn set_taken(&mut self, first: usize, n: usize) {
+        let end = first.saturating_add(n).min(self.len);
+        if first >= end {
+            return;
+        }
+        let first_w = first / 64;
+        let last_w = (end - 1) / 64;
+        let mut at = first;
+        while at < end {
+            let w = at / 64;
+            let b = at % 64;
+            let bits = (end - at).min(64 - b);
+            let mask = if bits == 64 { !0u64 } else { ((1u64 << bits) - 1) << b };
+            self.words[w] |= mask;
+            at += bits;
+        }
+        self.update_word_range(first_w, last_w);
+    }
+
+    fn clear_taken(&mut self, first: usize, n: usize) -> u32 {
+        let end = first.saturating_add(n).min(self.len);
+        if first >= end {
+            return 0;
+        }
+        let first_w = first / 64;
+        let last_w = (end - 1) / 64;
+        let mut at = first;
+        let mut freed = 0u32;
+        while at < end {
+            let w = at / 64;
+            let b = at % 64;
+            let bits = (end - at).min(64 - b);
+            let mask = if bits == 64 { !0u64 } else { ((1u64 << bits) - 1) << b };
+            let prev = self.words[w];
+            freed += (prev & mask).count_ones();
+            self.words[w] = prev & !mask;
+            at += bits;
+        }
+        if freed != 0 {
+            self.update_word_range(first_w, last_w);
+        }
+        freed
+    }
+
+    /// Length (capped at `cap`) of the contiguous free (0-bit) run containing
+    /// the freshly cleared range `[start, end)`.
+    fn free_run_around(&self, start: usize, end: usize, cap: usize) -> usize {
+        let mut run = end.saturating_sub(start);
+        let mut pos = end;
+        while pos < self.len && run < cap {
+            let w = pos / 64;
+            let b = pos % 64;
+            let avail = (self.len - pos).min(64 - b);
+            let zeros = ((self.words[w] >> b).trailing_zeros() as usize).min(avail);
+            run += zeros;
+            pos += zeros;
+            if zeros < avail {
+                break;
+            }
+        }
+        let mut pos = start;
+        while pos > 0 && run < cap {
+            let prev = pos - 1;
+            let w = prev / 64;
+            let b = prev % 64;
+            let avail = b + 1;
+            let zeros = ((self.words[w] << (63 - b)).leading_zeros() as usize).min(avail);
+            run += zeros;
+            pos -= zeros;
+            if zeros < avail {
+                break;
+            }
+        }
+        run
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
@@ -168,7 +534,7 @@ pub(crate) struct HostHeap {
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<(u32, DynamicBits)>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -189,6 +555,11 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// CPU-side shadow of `strides` (cached RAM, `2 * SLOT_STRIDES_COUNT`
+    /// dwords covering both word and count halves) to skip redundant uncached
+    /// PCIe `write_volatile` transactions when a slot's stride|kind or count
+    /// is unchanged.
+    strides_shadow: Vec<std::sync::atomic::AtomicU32>,
     /// Runs of raw-memory copy UAVs grow geometrically. Older reservations
     /// stay valid until this heap is destroyed because recorded command lists
     /// still use their base.
@@ -1549,10 +1920,17 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 fn dynamic_slots(count: u32, null: u32) -> u32 {
     static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
+        let default = if crate::residency::low_end_ram() {
+            DYNAMIC
+        } else if crate::residency::limited_host_ram() {
+            DYNAMIC << 1
+        } else {
+            DYNAMIC << 2
+        };
         std::env::var("VICTORY_DYNAMIC_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
+            .unwrap_or(default)
     });
     if null < PORTABLE_VIEWS {
         return DYNAMIC;
@@ -1669,9 +2047,16 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, DynamicBits::new(extra as usize))),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            strides_shadow: if strides.is_some() {
+                (0..victory_shader::emit::SLOT_STRIDES_COUNT as usize * 2)
+                    .map(|_| std::sync::atomic::AtomicU32::new(0))
+                    .collect()
+            } else {
+                Vec::new()
+            },
             strides,
             raw_pages: Mutex::new(None),
             buffers: Slots::new(count as usize),
@@ -1790,27 +2175,9 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
         let cursor = *next as usize;
         let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = if enough { taken.find_run(cursor, n) } else { None };
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -1827,7 +2194,7 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
+        taken.set_taken(first, n);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
@@ -2836,12 +3203,20 @@ impl HostHeap {
         if let Some((_, _, data)) = &self.strides
             && index < cap
         {
-            // SAFETY: inside the `2 * SLOT_STRIDES_COUNT` dword mapping; shaders
-            // read aligned dwords concurrently while we write.
-            unsafe {
-                let base = *data as *mut u32;
-                base.add(index as usize).write_volatile(word);
-                base.add((cap + index) as usize).write_volatile(count);
+            let i = index as usize;
+            let ci = cap as usize + i;
+            let base = *data as *mut u32;
+            if self.strides_shadow[i].load(std::sync::atomic::Ordering::Relaxed) != word {
+                self.strides_shadow[i].store(word, std::sync::atomic::Ordering::Relaxed);
+                // SAFETY: inside the `2 * SLOT_STRIDES_COUNT` dword mapping; shaders
+                // read aligned dwords concurrently while we write.
+                unsafe { base.add(i).write_volatile(word) };
+            }
+            if self.strides_shadow[ci].load(std::sync::atomic::Ordering::Relaxed) != count {
+                self.strides_shadow[ci].store(count, std::sync::atomic::Ordering::Relaxed);
+                // SAFETY: inside the `2 * SLOT_STRIDES_COUNT` dword mapping; shaders
+                // read aligned dwords concurrently while we write.
+                unsafe { base.add(ci).write_volatile(count) };
             }
         }
     }
@@ -2854,13 +3229,27 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
+        let end = at.saturating_add(n).min(self.dynamic);
+        if at >= end {
+            return;
+        }
+        // Retire any host COM resource references pinned in these dynamic slots
+        // before returning the range to the allocator so stale ID3D12Resource
+        // handles are not retained across the dynamic ring and cannot race with
+        // subsequent allocations.
+        for slot in at..end {
+            self.keep(self.count + slot, None);
+        }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        let given = guard.1.clear_taken(at as usize, (end - at) as usize);
+        if given != 0 {
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
-            self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
+            let cur = self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+            if cur != u32::MAX
+                && guard.1.free_run_around(at as usize, end as usize, cur as usize) >= cur as usize
+            {
+                self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
@@ -6198,6 +6587,176 @@ mod tests {
         assert_eq!(read_stride(s0 + 3), 0);
         assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
         assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
+    }
+
+    #[test]
+    fn dynamic_bits_skips_words_and_measures_coalesced_free_runs() {
+        let mut bits = DynamicBits::new(200);
+        // Occupy full words and partial spans across word boundaries.
+        bits.set_taken(0, 128);
+        assert_eq!(bits.find_run(0, 10), Some(128));
+        bits.set_taken(128, 72);
+        assert_eq!(bits.find_run(0, 1), None);
+
+        // Free a tiny 2-slot span: coalesced run around [63, 65) is 2 (< 8).
+        assert_eq!(bits.clear_taken(63, 2), 2);
+        assert_eq!(bits.free_run_around(63, 65, 8), 2);
+
+        // Free adjacent spans on both sides so they coalesce across a word boundary.
+        assert_eq!(bits.clear_taken(60, 3), 3);
+        assert_eq!(bits.clear_taken(65, 3), 3);
+        assert_eq!(bits.free_run_around(65, 68, 8), 8);
+        assert_eq!(bits.max_free_run(), 8);
+        assert_eq!(bits.find_run(64, 9), None);
+        assert_eq!(bits.find_run(64, 8), Some(60));
+    }
+
+    #[test]
+    fn dynamic_bits_hrla_matches_oracle_across_sizes_and_wraparound() {
+        fn next_u64(state: &mut u64) -> u64 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            x
+        }
+
+        fn oracle_max_free_run(taken: &[bool]) -> usize {
+            let mut best = 0usize;
+            let mut cur = 0usize;
+            for &is_taken in taken {
+                if is_taken {
+                    cur = 0;
+                } else {
+                    cur += 1;
+                    best = best.max(cur);
+                }
+            }
+            best
+        }
+
+        fn oracle_find_in(taken: &[bool], start: usize, limit: usize, need: usize) -> Option<usize> {
+            let limit = limit.min(taken.len());
+            if need == 0 || limit.saturating_sub(start) < need {
+                return None;
+            }
+            let mut run = 0usize;
+            for (i, &is_taken) in taken.iter().enumerate().take(limit).skip(start) {
+                if is_taken {
+                    run = 0;
+                } else {
+                    run += 1;
+                    if run == need {
+                        return Some(i + 1 - need);
+                    }
+                }
+            }
+            None
+        }
+
+        fn oracle_find_run(taken: &[bool], cursor: usize, need: usize) -> Option<usize> {
+            let len = taken.len();
+            if need == 0 || need > len {
+                return None;
+            }
+            if let Some(at) = oracle_find_in(taken, cursor, len, need) {
+                return Some(at);
+            }
+            let second_end = cursor.saturating_add(need.saturating_sub(1)).min(len);
+            oracle_find_in(taken, 0, second_end, need)
+        }
+
+        // Empty bitset edge case.
+        let empty = DynamicBits::new(0);
+        assert_eq!(empty.max_free_run(), 0);
+        assert_eq!(empty.find_run(0, 1), None);
+        assert_eq!(empty.find_in(0, 0, 1), None);
+
+        let mut rng = 0x5EED_CAFE_1234_5678u64;
+        for size in [1usize, 2, 7, 16, 64, 130, 500] {
+            let mut bits = DynamicBits::new(size);
+            let mut oracle = vec![false; size];
+            assert_eq!(bits.max_free_run(), size);
+
+            for step in 0..250usize {
+                let op = (next_u64(&mut rng) % 3) as usize;
+                match op {
+                    0 => {
+                        let max_need = size.min(160);
+                        let need = (next_u64(&mut rng) as usize % max_need) + 1;
+                        let cursor = next_u64(&mut rng) as usize % (size + 1);
+                        let got = bits.find_run(cursor, need);
+                        let exp = oracle_find_run(&oracle, cursor, need);
+                        assert_eq!(
+                            got, exp,
+                            "find_run mismatch at size={size}, step={step}, cursor={cursor}, need={need}"
+                        );
+                        if let Some(at) = got {
+                            bits.set_taken(at, need);
+                            oracle[at..at + need].fill(true);
+                        }
+                    }
+                    1 => {
+                        let first = next_u64(&mut rng) as usize % size;
+                        let span = (next_u64(&mut rng) as usize % (size - first).min(96)) + 1;
+                        bits.set_taken(first, span);
+                        oracle[first..first + span].fill(true);
+                    }
+                    _ => {
+                        let first = next_u64(&mut rng) as usize % size;
+                        let span = (next_u64(&mut rng) as usize % (size - first).min(96)) + 1;
+                        let freed = bits.clear_taken(first, span);
+                        let exp_freed = oracle[first..first + span].iter().filter(|&&t| t).count() as u32;
+                        assert_eq!(freed, exp_freed, "clear_taken count mismatch at size={size}, step={step}");
+                        oracle[first..first + span].fill(false);
+                    }
+                }
+
+                let mfr = bits.max_free_run();
+                let exp_mfr = oracle_max_free_run(&oracle);
+                assert_eq!(mfr, exp_mfr, "max_free_run mismatch at size={size}, step={step}");
+
+                // Exact O(1) rejection when max_free_run() < need.
+                let rej_cursor = next_u64(&mut rng) as usize % (size + 1);
+                assert_eq!(bits.find_run(rej_cursor, mfr + 1), None);
+                assert_eq!(bits.find_in(0, size, mfr + 1), None);
+
+                // Boundary wrap-around find at exact max_free_run.
+                if mfr > 0 {
+                    let wrap_cursor = size.saturating_sub(1);
+                    assert_eq!(
+                        bits.find_run(wrap_cursor, mfr),
+                        oracle_find_run(&oracle, wrap_cursor, mfr),
+                        "wrap-around mismatch at size={size}, step={step}"
+                    );
+                }
+
+                // Random subrange query.
+                let start = next_u64(&mut rng) as usize % size;
+                let limit = start + (next_u64(&mut rng) as usize % (size - start + 1));
+                let need = (next_u64(&mut rng) as usize % (limit - start + 2)) + 1;
+                assert_eq!(
+                    bits.find_in(start, limit, need),
+                    oracle_find_in(&oracle, start, limit, need),
+                    "find_in mismatch at size={size}, step={step}, range=[{start}..{limit}), need={need}"
+                );
+            }
+        }
+
+        // Explicit boundary wrap-around across a 64-bit word seam.
+        for size in [130usize, 500] {
+            let mut bits = DynamicBits::new(size);
+            bits.set_taken(0, size);
+            assert_eq!(bits.max_free_run(), 0);
+            assert_eq!(bits.find_run(0, 1), None);
+
+            assert_eq!(bits.clear_taken(60, 8), 8);
+            assert_eq!(bits.max_free_run(), 8);
+            assert_eq!(bits.find_run(64, 9), None);
+            assert_eq!(bits.find_run(64, 8), Some(60));
+            assert_eq!(bits.find_run(size - 1, 8), Some(60));
+        }
     }
 }
 

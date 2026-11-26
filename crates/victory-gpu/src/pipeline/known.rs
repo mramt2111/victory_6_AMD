@@ -18,11 +18,12 @@
 //! hashes, and the graphics state). They hold the title's own code: they stay
 //! in the cache folder.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -468,6 +469,238 @@ impl GraphicsState {
     }
 }
 
+/// Maximum time between two PSO draws to count them as co-occurring (tau = 0.5 s).
+const CO_OCCURRENCE_WINDOW: Duration = Duration::from_millis(500);
+/// Maximum distinct PSO keys tracked in memory (for both edges and compile-time EWMA).
+const CO_OCCURRENCE_MAX_KEYS: usize = 4_096;
+/// Maximum co-occurring neighbors retained per PSO key.
+const CO_OCCURRENCE_MAX_NEIGHBORS: usize = 8;
+/// Maximum recent draws kept in the active sliding window.
+const CO_OCCURRENCE_RECENT_CAP: usize = 16;
+/// Exponential decay half-life for co-occurrence weights (T_1/2 = 120 s).
+const CO_OCCURRENCE_HALF_LIFE_SECS: f32 = 120.0;
+/// Exponential decay rate lambda = ln(2) / T_1/2 (s^-1).
+const CO_OCCURRENCE_LAMBDA: f32 = std::f32::consts::LN_2 / CO_OCCURRENCE_HALF_LIFE_SECS;
+/// Intra-window temporal kernel rate alpha = 2.0 s^-1 for exp(-alpha * dt).
+const CO_OCCURRENCE_ALPHA: f32 = 2.0;
+/// Default prior compile duration c_hat = 8.0 ms for unseen PSOs.
+const COMPILE_MS_PRIOR: f32 = 8.0;
+/// Frame wait-budget cap (ms) in Smith's-rule utility numerator min(c_hat, 32.0).
+const COMPILE_MS_BUDGET_CAP: f32 = 32.0;
+/// Fixed overhead term (ms) in Smith's-rule utility denominator (c_hat + 0.5).
+const COMPILE_MS_OVERHEAD: f32 = 0.5;
+/// EWMA smoothing factor for per-PSO measured compile durations.
+const COMPILE_MS_EWMA_ALPHA: f32 = 0.25;
+
+#[derive(Clone, Copy)]
+struct DecayedEdge {
+    key: u64,
+    weight: f32,
+    last_updated: Instant,
+}
+
+impl DecayedEdge {
+    #[inline]
+    fn decayed_weight(&self, now: Instant) -> f32 {
+        let elapsed = now.saturating_duration_since(self.last_updated).as_secs_f32();
+        self.weight * (-CO_OCCURRENCE_LAMBDA * elapsed).exp()
+    }
+}
+
+struct CoOccurrenceTracker {
+    recent: VecDeque<(u64, Instant)>,
+    graph: HashMap<u64, Vec<DecayedEdge>>,
+    compile_ms: HashMap<u64, f32>,
+    last_now: Option<Instant>,
+    window: Duration,
+    max_keys: usize,
+    max_neighbors: usize,
+}
+
+impl CoOccurrenceTracker {
+    fn new() -> Self {
+        Self::with_limits(
+            CO_OCCURRENCE_WINDOW,
+            CO_OCCURRENCE_MAX_KEYS,
+            CO_OCCURRENCE_MAX_NEIGHBORS,
+        )
+    }
+
+    fn with_limits(window: Duration, max_keys: usize, max_neighbors: usize) -> Self {
+        Self {
+            recent: VecDeque::with_capacity(CO_OCCURRENCE_RECENT_CAP),
+            graph: HashMap::new(),
+            compile_ms: HashMap::new(),
+            last_now: None,
+            window,
+            max_keys,
+            max_neighbors,
+        }
+    }
+
+    fn record_at(&mut self, key: u64, now: Instant) {
+        self.last_now = Some(self.last_now.map_or(now, |prev| prev.max(now)));
+        while let Some(&(_, ts)) = self.recent.front() {
+            if now.saturating_duration_since(ts) > self.window {
+                let _ = self.recent.pop_front();
+            } else {
+                break;
+            }
+        }
+        for i in 0..self.recent.len() {
+            let (prev, prev_ts) = self.recent[i];
+            if prev != key {
+                let dt = now.saturating_duration_since(prev_ts);
+                self.add_edge(prev, key, now, dt);
+                self.add_edge(key, prev, now, dt);
+            }
+        }
+        if let Some(pos) = self.recent.iter().position(|&(k, _)| k == key) {
+            let _ = self.recent.remove(pos);
+        } else if self.recent.len() >= CO_OCCURRENCE_RECENT_CAP {
+            let _ = self.recent.pop_front();
+        }
+        self.recent.push_back((key, now));
+    }
+
+    fn add_edge(&mut self, from: u64, to: u64, now: Instant, dt: Duration) {
+        if self.max_keys == 0 || self.max_neighbors == 0 {
+            return;
+        }
+        let delta_w = if dt <= self.window {
+            (-CO_OCCURRENCE_ALPHA * dt.as_secs_f32()).exp()
+        } else {
+            0.0
+        };
+        if delta_w <= 0.0 {
+            return;
+        }
+        if !self.graph.contains_key(&from) && self.graph.len() >= self.max_keys {
+            return;
+        }
+        let neighbors = self.graph.entry(from).or_default();
+        if let Some(edge) = neighbors.iter_mut().find(|e| e.key == to) {
+            edge.weight = edge.decayed_weight(now) + delta_w;
+            edge.last_updated = now;
+            return;
+        }
+        if neighbors.len() < self.max_neighbors {
+            neighbors.push(DecayedEdge {
+                key: to,
+                weight: delta_w,
+                last_updated: now,
+            });
+        } else if let Some((min_idx, min_weight)) = neighbors
+            .iter()
+            .enumerate()
+            .map(|(idx, e)| (idx, e.decayed_weight(now)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            && min_weight <= delta_w
+        {
+            neighbors[min_idx] = DecayedEdge {
+                key: to,
+                weight: delta_w,
+                last_updated: now,
+            };
+        }
+    }
+
+    fn record_compile_ms(&mut self, key: u64, ms: f32) {
+        if !ms.is_finite() || ms < 0.0 || self.max_keys == 0 {
+            return;
+        }
+        if let Some(ewma) = self.compile_ms.get_mut(&key) {
+            *ewma = *ewma * (1.0 - COMPILE_MS_EWMA_ALPHA) + ms * COMPILE_MS_EWMA_ALPHA;
+            return;
+        }
+        if self.compile_ms.len() >= self.max_keys {
+            return;
+        }
+        let _ = self.compile_ms.insert(key, ms);
+    }
+
+    fn estimated_compile_ms(&self, key: u64) -> f32 {
+        self.compile_ms.get(&key).copied().unwrap_or(COMPILE_MS_PRIOR)
+    }
+
+    fn predicted_neighbors(&self, key: u64, limit: usize) -> Vec<u64> {
+        let now = self.last_now.unwrap_or_else(Instant::now);
+        self.predicted_neighbors_at(key, limit, now)
+    }
+
+    fn predicted_neighbors_at(&self, key: u64, limit: usize, now: Instant) -> Vec<u64> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let Some(neighbors) = self.graph.get(&key) else {
+            return Vec::new();
+        };
+        let mut weights: Vec<(u64, f32)> = Vec::with_capacity(neighbors.len());
+        let mut total_weight = 0.0f32;
+        for edge in neighbors {
+            let w = edge.decayed_weight(now);
+            if w > 0.0 && w.is_finite() {
+                total_weight += w;
+                weights.push((edge.key, w));
+            }
+        }
+        if total_weight <= 0.0 || !total_weight.is_finite() {
+            return Vec::new();
+        }
+        let mut ranked: Vec<(u64, f32)> = weights
+            .into_iter()
+            .map(|(neighbor, w)| {
+                let p_ij = w / total_weight;
+                let c_hat = self.estimated_compile_ms(neighbor);
+                let utility =
+                    (p_ij * c_hat.min(COMPILE_MS_BUDGET_CAP)) / (c_hat + COMPILE_MS_OVERHEAD);
+                (neighbor, utility)
+            })
+            .collect();
+        ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(limit);
+        ranked.into_iter().map(|(k, _)| k).collect()
+    }
+}
+
+static CO_OCCURRENCE: Mutex<Option<CoOccurrenceTracker>> = Mutex::new(None);
+
+/// Records a PSO key drawn/bound by the title so co-occurring PSOs drawn
+/// within 500 ms can be speculatively pre-warmed.
+pub(crate) fn record_draw_key(key: u64) {
+    let now = Instant::now();
+    let mut tracker = CO_OCCURRENCE.lock().unwrap_or_else(|e| e.into_inner());
+    tracker
+        .get_or_insert_with(CoOccurrenceTracker::new)
+        .record_at(key, now);
+}
+
+/// Records a measured PSO compile duration (in milliseconds) in the per-PSO
+/// EWMA estimator used by Smith's-rule utility ranking.
+pub(crate) fn record_compile_ms(key: u64, ms: f32) {
+    if !ms.is_finite() || ms < 0.0 {
+        return;
+    }
+    let mut tracker = CO_OCCURRENCE.lock().unwrap_or_else(|e| e.into_inner());
+    tracker
+        .get_or_insert_with(CoOccurrenceTracker::new)
+        .record_compile_ms(key, ms);
+}
+
+/// Returns up to `limit` neighbor PSO keys ranked by exponentially decayed
+/// Smith's-rule utility.
+pub(crate) fn predicted_neighbors(key: u64, limit: usize) -> Vec<u64> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let now = Instant::now();
+    let tracker = CO_OCCURRENCE.lock().unwrap_or_else(|e| e.into_inner());
+    tracker
+        .as_ref()
+        .map(|t| t.predicted_neighbors_at(key, limit, now))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,5 +807,122 @@ mod tests {
         assert_eq!(walk_shaders(&dir, |stage, hash, at, len| seen.push((stage, hash[0], at, len))), one);
         assert_eq!(seen, [(5, 9, 37, 4)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn co_occurrence_recording_ranking_and_bounds() {
+        let base = Instant::now();
+        let mut tracker = CoOccurrenceTracker::new();
+        assert_eq!(tracker.window, Duration::from_millis(500));
+        assert_eq!(tracker.max_keys, 4_096);
+        assert_eq!(tracker.max_neighbors, 8);
+
+        // Draw key 10 with 20 three times, with 30 twice, and with 40 once within 500 ms.
+        tracker.record_at(10, base);
+        tracker.record_at(20, base + Duration::from_millis(50));
+        tracker.record_at(30, base + Duration::from_millis(100));
+        tracker.record_at(40, base + Duration::from_millis(150));
+
+        tracker.record_at(10, base + Duration::from_millis(200));
+        tracker.record_at(20, base + Duration::from_millis(220));
+        tracker.record_at(30, base + Duration::from_millis(240));
+
+        tracker.record_at(10, base + Duration::from_millis(300));
+        tracker.record_at(20, base + Duration::from_millis(320));
+
+        // Key 50 arrives > 500 ms after the previous draws: must not pair with 10/20/30/40.
+        tracker.record_at(50, base + Duration::from_millis(1_000));
+
+        assert_eq!(tracker.predicted_neighbors(10, 4), vec![20, 30, 40]);
+        assert_eq!(tracker.predicted_neighbors(10, 2), vec![20, 30]);
+        assert_eq!(tracker.predicted_neighbors(10, 0), Vec::<u64>::new());
+        assert_eq!(tracker.predicted_neighbors(50, 4), Vec::<u64>::new());
+
+        // Verify key and neighbor capacity bounds.
+        let mut bounded = CoOccurrenceTracker::with_limits(Duration::from_millis(500), 4, 3);
+        let t0 = Instant::now();
+        for k in 1..=12u64 {
+            bounded.record_at(k, t0 + Duration::from_millis(k * 10));
+        }
+        assert!(bounded.graph.len() <= 4);
+        for neighbors in bounded.graph.values() {
+            assert!(neighbors.len() <= 3);
+        }
+        for k in 1..=12u64 {
+            bounded.record_compile_ms(k, 5.0);
+        }
+        assert!(bounded.compile_ms.len() <= 4);
+    }
+
+    #[test]
+    fn exponential_decay_forgets_stale_levels() {
+        let base = Instant::now();
+        let mut tracker = CoOccurrenceTracker::new();
+
+        // Level 1: draw key 10 with stale neighbor 20 six times (1 s apart, dt = 20 ms each).
+        for step in 0..6u64 {
+            let t = base + Duration::from_secs(step);
+            tracker.record_at(10, t);
+            tracker.record_at(20, t + Duration::from_millis(20));
+        }
+        assert_eq!(
+            tracker.predicted_neighbors_at(10, 2, base + Duration::from_secs(6)),
+            vec![20]
+        );
+
+        // Verify exact half-life decay on a stored edge after 120 s.
+        let edge_20 = tracker
+            .graph
+            .get(&10)
+            .and_then(|edges| edges.iter().find(|e| e.key == 20))
+            .copied()
+            .expect("edge 10 -> 20 present");
+        let after_half_life = edge_20.decayed_weight(edge_20.last_updated + Duration::from_secs(120));
+        assert!((after_half_life - edge_20.weight * 0.5).abs() < 1e-4);
+
+        // Level 2 (10 minutes = 5 half-lives later): stale weight decays by 2^-5 = 1/32,
+        // so a single fresh co-occurrence with neighbor 30 outranks stale neighbor 20.
+        let level2 = base + Duration::from_secs(600);
+        tracker.record_at(10, level2);
+        tracker.record_at(30, level2 + Duration::from_millis(20));
+        assert_eq!(
+            tracker.predicted_neighbors_at(10, 2, level2 + Duration::from_millis(20)),
+            vec![30, 20]
+        );
+    }
+
+    #[test]
+    fn smiths_rule_utility_ranks_fast_psos_above_slow_compute() {
+        let base = Instant::now();
+        let mut tracker = CoOccurrenceTracker::new();
+
+        // Pair key 100 with slow compute PSO 200 three times, and fast graphics PSO 300 once.
+        for step in 0..3u64 {
+            let t = base + Duration::from_secs(step);
+            tracker.record_at(100, t);
+            tracker.record_at(200, t + Duration::from_millis(20));
+        }
+        let t_fast = base + Duration::from_secs(3);
+        tracker.record_at(100, t_fast);
+        tracker.record_at(300, t_fast + Duration::from_millis(20));
+
+        // With equal default priors (8.0 ms), higher-probability 200 outranks 300.
+        assert_eq!(tracker.estimated_compile_ms(200), COMPILE_MS_PRIOR);
+        assert_eq!(tracker.estimated_compile_ms(300), COMPILE_MS_PRIOR);
+        assert_eq!(tracker.predicted_neighbors(100, 2), vec![200, 300]);
+
+        // Record measured compile times: 200 takes 2,000 ms, 300 takes 4 ms.
+        // U(300|100) ~= (0.25 * 4.0) / 4.5 ~= 0.222 >> U(200|100) ~= (0.75 * 32.0) / 2000.5 ~= 0.012.
+        tracker.record_compile_ms(200, 2_000.0);
+        tracker.record_compile_ms(300, 4.0);
+        assert_eq!(tracker.predicted_neighbors(100, 2), vec![300, 200]);
+
+        // Verify EWMA smoothing and non-finite / negative guards.
+        tracker.record_compile_ms(300, 12.0);
+        assert!((tracker.estimated_compile_ms(300) - 6.0).abs() < 1e-5);
+        tracker.record_compile_ms(300, f32::NAN);
+        tracker.record_compile_ms(300, f32::INFINITY);
+        tracker.record_compile_ms(300, -5.0);
+        assert!((tracker.estimated_compile_ms(300) - 6.0).abs() < 1e-5);
     }
 }

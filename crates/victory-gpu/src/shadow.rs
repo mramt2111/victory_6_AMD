@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -43,11 +43,17 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// Whether any page in `copied` has been marked non-zero, so empty
+    /// fast-paths can skip locking `copied`.
+    has_copied: std::sync::atomic::AtomicBool,
     /// Two ranges of title memory taken whole, the last one and the longest,
     /// and the asking after which each was ([`Shadow::copy_stale`]). A page
     /// a range holds in part cannot say so in `copied`. Locked inside
     /// `copied`'s lock.
     ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// Whether `ranged` has ever been populated, so [`Shadow::ranged`] can
+    /// skip locking `ranged` when it is still empty.
+    has_ranged: std::sync::atomic::AtomicBool,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -105,6 +111,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Information-theoretic optimal dirty-stride estimator (`IT-DSE`),
+    /// updated on dirty range commits.
+    stride_estimator: OptimalStrideEstimator,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -135,6 +144,132 @@ struct Card {
     hash_stale: Mutex<Vec<u64>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+/// Information-Theoretic Optimal Dirty-Stride Estimator (`IT-DSE`).
+///
+/// Tracks lock-free EWMAs of the empirical dirty fraction `p` in `(0, 1]` and
+/// average contiguous dirty run length `r` (in bytes) per [`Shadow`] buffer.
+/// Computes the closed-form optimal block size
+/// `b* = sqrt((C_meta * r) / (C_pcie * p))`, rounded to the cost-minimizing
+/// power of two clamped in `[4 KiB, 256 KiB]`.
+pub(crate) struct OptimalStrideEstimator {
+    /// EWMA of empirical dirty fraction `p`, stored as `f32::to_bits()`.
+    ewma_p_bits: AtomicU32,
+    /// EWMA of average contiguous dirty run length `r` (bytes), stored as `f32::to_bits()`.
+    ewma_r_bits: AtomicU32,
+}
+
+impl OptimalStrideEstimator {
+    /// Minimum allowed dirty-tracking block stride (4 KiB).
+    const MIN_STRIDE: usize = 4 << 10;
+    /// Maximum allowed dirty-tracking block stride (256 KiB).
+    const MAX_STRIDE: usize = 256 << 10;
+    /// Default stride returned before any valid observations (64 KiB).
+    const DEFAULT_STRIDE: usize = PIECE;
+    /// Per-block metadata/hash/dispatch overhead `C_meta` (ns).
+    const C_META: f64 = 256.0;
+    /// Effective PCIe per-byte transfer cost `C_pcie` (ns/byte, ~16 GB/s;
+    /// `C_META / C_PCIE = 4096` byte-equivalents per block).
+    const C_PCIE: f64 = 0.0625;
+    /// EWMA smoothing factor `alpha` in `(0, 1]`.
+    const EWMA_ALPHA: f32 = 0.25;
+    /// Lower floor for `p` to guard against underflow and division by zero.
+    const MIN_P: f32 = 1e-6;
+
+    /// Creates a fresh estimator with no prior observations.
+    const fn new() -> Self {
+        Self {
+            ewma_p_bits: AtomicU32::new(0),
+            ewma_r_bits: AtomicU32::new(0),
+        }
+    }
+
+    /// Lock-free EWMA update on an `AtomicU32`-packed `f32`.
+    fn update_ewma(slot: &AtomicU32, sample: f32) {
+        let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+            let prev = f32::from_bits(bits);
+            let next = if !prev.is_finite() || prev <= 0.0 {
+                sample
+            } else {
+                Self::EWMA_ALPHA * sample + (1.0 - Self::EWMA_ALPHA) * prev
+            };
+            Some(next.to_bits())
+        });
+    }
+
+    /// Records an empirical observation of dirty fraction `p` and average
+    /// contiguous dirty run length `r_bytes`. Degenerate (`<= 0`, NaN, or
+    /// infinite) inputs are safely ignored.
+    fn observe(&self, p: f32, r_bytes: f32) {
+        if !p.is_finite() || !r_bytes.is_finite() || p <= 0.0 || r_bytes <= 0.0 {
+            return;
+        }
+        let p = p.clamp(Self::MIN_P, 1.0);
+        let r = r_bytes.max(1.0);
+        Self::update_ewma(&self.ewma_p_bits, p);
+        Self::update_ewma(&self.ewma_r_bits, r);
+    }
+
+    /// Updates the estimator from committed dirty byte ranges `[from, to)` on
+    /// a buffer of total length `buffer_len`.
+    fn observe_commit(&self, buffer_len: u64, ranges: &[(usize, usize)]) {
+        if buffer_len == 0 || ranges.is_empty() {
+            return;
+        }
+        let mut dirty_bytes: usize = 0;
+        let mut run_count: usize = 0;
+        for &(from, to) in ranges {
+            if to > from {
+                dirty_bytes = dirty_bytes.saturating_add(to - from);
+                run_count += 1;
+            }
+        }
+        self.observe_counts(buffer_len, dirty_bytes, run_count);
+    }
+
+    /// Updates the estimator from aggregated dirty byte count and run count.
+    fn observe_counts(&self, buffer_len: u64, dirty_bytes: usize, run_count: usize) {
+        if buffer_len == 0 || dirty_bytes == 0 || run_count == 0 {
+            return;
+        }
+        let p = (dirty_bytes as f64 / buffer_len as f64).clamp(Self::MIN_P as f64, 1.0) as f32;
+        let r = (dirty_bytes as f64 / run_count as f64) as f32;
+        self.observe(p, r);
+    }
+
+    /// Computes the closed-form optimal block size
+    /// `b* = sqrt((C_meta * r) / (C_pcie * p))`, rounded to the nearest power
+    /// of two in `[MIN_STRIDE, MAX_STRIDE]`.
+    fn compute_optimal_stride(p: f64, r_bytes: f64) -> usize {
+        if !p.is_finite() || !r_bytes.is_finite() || p <= 0.0 || r_bytes <= 0.0 {
+            return Self::DEFAULT_STRIDE;
+        }
+        let p_clamped = p.clamp(Self::MIN_P as f64, 1.0);
+        let ratio = (Self::C_META * r_bytes) / (Self::C_PCIE * p_clamped);
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return Self::DEFAULT_STRIDE;
+        }
+        let b_star = ratio.sqrt();
+        if !b_star.is_finite() || b_star <= Self::MIN_STRIDE as f64 {
+            return Self::MIN_STRIDE;
+        }
+        if b_star >= Self::MAX_STRIDE as f64 {
+            return Self::MAX_STRIDE;
+        }
+        // Total cost J(b) = A/b + B*b is symmetric in log2(b) around b*, so
+        // rounding log2(b*) selects the exact cost-minimizing power of two.
+        let exp = b_star.log2().round() as u32;
+        (1usize << exp).clamp(Self::MIN_STRIDE, Self::MAX_STRIDE)
+    }
+
+    /// Returns the current optimal dirty-tracking stride in bytes, always a
+    /// power of two in `[4096, 262144]`.
+    fn optimal_stride(&self) -> usize {
+        let p = f32::from_bits(self.ewma_p_bits.load(Ordering::Relaxed)) as f64;
+        let r = f32::from_bits(self.ewma_r_bits.load(Ordering::Relaxed)) as f64;
+        Self::compute_optimal_stride(p, r)
+    }
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -176,8 +311,9 @@ pub(crate) fn cards() -> bool {
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
-/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
-///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
+/// - `<= 8 GiB` (8 GB cards): `(32, 256)` MiB.
+/// - Unknown (`None`, e.g. WARP) or `> 8 GiB` and `<= 12 GiB` (10–12 GB cards):
+///   `(16, 512)` MiB, matching the 12 GB baseline.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
 ///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
 /// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
@@ -188,9 +324,12 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
         return (16, 512);
     };
     let budget_mb = budget_bytes >> 20;
+    const EIGHT_GIB_MB: u64 = 8 * 1024;
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
-    if budget_mb <= TWELVE_GIB_MB {
+    if budget_mb <= EIGHT_GIB_MB {
+        (32, 256)
+    } else if budget_mb <= TWELVE_GIB_MB {
         (16, 512)
     } else if budget_mb < TWENTY_GIB_MB {
         (4, 2048)
@@ -798,6 +937,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             })
             .unwrap_or_default();
         if !ranges.is_empty() {
+            shadow.stride_estimator.observe_commit(shadow.len, &ranges);
             out.push((shadow, ranges));
         }
         true
@@ -1485,21 +1625,24 @@ fn pooled(n: usize) -> Vec<u8> {
 /// [`Shadow::writing`]), and the page faults of filling it.
 fn snapshots_kept() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| std::env::var("VICTORY_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024))
+    *MOST.get_or_init(|| {
+        let default = if crate::residency::low_end_ram() { 128 } else { 1024 };
+        std::env::var("VICTORY_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    })
 }
 
 /// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
 /// the largest, and of those the largest one and the next ones up to `KEPT`
-/// bytes in all.
+/// bytes in all (`128 MiB` on `low_end_ram()`, `512 MiB` otherwise).
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let kept_limit: usize = if crate::residency::low_end_ram() { 128 << 20 } else { 512 << 20 };
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if kept > 0 && total > kept_limit {
             break;
         }
         kept += 1;
@@ -1669,6 +1812,9 @@ struct Workers {
 /// most (0, the default: not at all): asleep, a thread is woken in 50 us and
 /// more, 95 times a frame.
 fn spin(there: impl Fn() -> bool) {
+    if crate::residency::low_end_cpu() {
+        return;
+    }
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
     if most == 0 {
@@ -1684,7 +1830,7 @@ fn spin(there: impl Fn() -> bool) {
 
 /// How many threads are kept for [`wide`].
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4)
 }
 
 fn workers() -> &'static Workers {
@@ -3009,6 +3155,28 @@ pub(crate) fn window_use() -> [u64; 8] {
 ///
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
+/// Soft cap on total live bytes across [`LOOSE`] window shadows
+/// (`VICTORY_WINDOW_BUDGET_MB`, in MiB; `0`: uncapped).
+/// Defaults to `512 MiB` on `low_end_ram()`, `1024 MiB` on `limited_host_ram()`,
+/// and `0` (uncapped) on `> 32 GiB` hosts.
+fn window_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let default_mb = if crate::residency::low_end_ram() {
+            512
+        } else if crate::residency::limited_host_ram() {
+            1024
+        } else {
+            0
+        };
+        std::env::var("VICTORY_WINDOW_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(default_mb)
+            .saturating_mul(1 << 20)
+    })
+}
+
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
     let gone: Vec<Arc<Shadow>> = {
@@ -3028,7 +3196,34 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let mut gone: Vec<Arc<Shadow>> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
+        let budget = window_budget();
+        if budget > 0 && !map.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            let mut total: u64 = 0;
+            let mut evictable: Vec<(u64, (u64, u64), u64)> = Vec::new();
+            for (&key, s) in map.iter() {
+                if seen.insert(Arc::as_ptr(s) as usize) {
+                    total = total.saturating_add(s.len);
+                }
+                if Arc::strong_count(s) == 1 && crate::host::references(&s.buffer) == 1 {
+                    evictable.push((s.used.load(Ordering::Relaxed), key, s.len));
+                }
+            }
+            if total > budget && !evictable.is_empty() {
+                evictable.sort_unstable_by_key(|&(used, _, _)| used);
+                for (_, key, len) in evictable {
+                    if total <= budget {
+                        break;
+                    }
+                    if let Some(shadow) = map.remove(&key) {
+                        total = total.saturating_sub(len);
+                        gone.push(shadow);
+                    }
+                }
+            }
+        }
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -3175,7 +3370,9 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            has_copied: std::sync::atomic::AtomicBool::new(false),
             ranged: Mutex::default(),
+            has_ranged: std::sync::atomic::AtomicBool::new(false),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             pending_count: AtomicUsize::new(0),
@@ -3196,6 +3393,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            stride_estimator: OptimalStrideEstimator::new(),
         }
     }
 
@@ -3809,10 +4007,15 @@ impl Shadow {
             drop(merging);
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let mut any_copied = false;
                 for page in taken {
                     if let Some(at) = copied.get_mut(page - base) {
                         *at = now;
+                        any_copied |= now != 0;
                     }
+                }
+                if any_copied {
+                    self.has_copied.store(true, Ordering::Release);
                 }
             }
             if over.into_inner() {
@@ -3955,6 +4158,9 @@ impl Shadow {
         {
             return false;
         }
+        if !self.has_copied.load(Ordering::Acquire) && !self.has_ranged.load(Ordering::Acquire) {
+            return false;
+        }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let ranged = self.ranged(from, to);
         let same = match j {
@@ -3973,6 +4179,9 @@ impl Shadow {
     /// The latest asking after which a range that holds `[from, to)` was
     /// taken whole (0: none is known). The caller holds `copied`'s lock.
     fn ranged(&self, from: usize, to: usize) -> u64 {
+        if !self.has_ranged.load(Ordering::Acquire) {
+            return 0;
+        }
         let ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
         ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
     }
@@ -4080,6 +4289,7 @@ impl Shadow {
         let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
         // Pages taken before and written since: in the order of their runs.
         let mut again_at: Vec<(usize, u64)> = Vec::new();
+        let mut any_copied = false;
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -4097,6 +4307,7 @@ impl Shadow {
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
+                    any_copied |= now != 0;
                 }
                 // Cut where pages taken before meet pages never taken.
                 let again = taken != 0;
@@ -4114,6 +4325,9 @@ impl Shadow {
                 runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
             }
         }
+        if any_copied {
+            self.has_copied.store(true, Ordering::Release);
+        }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some((first, known)) = run {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
@@ -4126,6 +4340,9 @@ impl Shadow {
             ranged[0] = (from, to, now);
             if to - from >= ranged[1].1 - ranged[1].0 {
                 ranged[1] = (from, to, now);
+            }
+            if now != 0 {
+                self.has_ranged.store(true, Ordering::Release);
             }
         }
         bytes
@@ -4337,15 +4554,28 @@ impl Shadow {
         self.card_changed_runs(std::iter::once((from, to)));
     }
 
+    /// Returns the information-theoretic optimal dirty-tracking block stride
+    /// (in bytes) for this buffer, always a power of two in `[4 KiB, 256 KiB]`.
+    pub(crate) fn optimal_stride(&self) -> usize {
+        self.stride_estimator.optimal_stride()
+    }
+
     /// [`Shadow::card_changed`] of each of `runs`.
     fn card_changed_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
-        let Some(card) = &self.card else {
-            return;
-        };
         let mut runs = runs.filter(|r| r.0 < r.1).peekable();
         if runs.peek().is_none() {
             return;
         }
+        let Some(card) = &self.card else {
+            let mut dirty_bytes: usize = 0;
+            let mut run_count: usize = 0;
+            for (from, to) in runs {
+                dirty_bytes = dirty_bytes.saturating_add(to - from);
+                run_count += 1;
+            }
+            self.stride_estimator.observe_counts(self.len, dirty_bytes, run_count);
+            return;
+        };
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
         for (from, to) in runs {
             match dirty.last_mut() {
@@ -4721,6 +4951,7 @@ impl Shadow {
         let card = self.card.as_ref().unwrap();
         let mut dirty = card.dirty.lock().unwrap();
         let ranges = std::mem::take(&mut *dirty);
+        self.stride_estimator.observe_commit(self.len, &ranges);
         let mut sent = card.sent.lock().unwrap();
         sent.forget(merged);
         sent.note(number, ranges.clone());
@@ -4824,6 +5055,9 @@ impl Shadow {
     /// later has a number above it: a write of the title's takes the block's
     /// bit, until an asking has noted it.
     pub(crate) fn landed(&self, block: usize, before: u64, now: u64) -> bool {
+        if !self.has_copied.load(Ordering::Acquire) {
+            return false;
+        }
         let Some(page) = block.checked_sub(self.start as usize / PAGE) else {
             return false;
         };
@@ -5391,7 +5625,11 @@ const WINDOW: u64 = 4 << 20;
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
-        let kb = std::env::var("VICTORY_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let default_kb = crate::residency::low_end_ram().then_some(256);
+        let kb = std::env::var("VICTORY_WINDOW_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .or(default_kb);
         grid(kb)
     })
 }
@@ -5430,7 +5668,10 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// tail is that.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_WINDOW_TAILS") {
+        Some(v) => v == "1",
+        None => crate::residency::low_end_ram(),
+    })
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,
@@ -5818,9 +6059,10 @@ mod window_tests {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
 
-        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        // <= 8 GiB uses tighter (32, 256) MiB limits; unknown and 9–12 GiB keep the 12 GB baseline.
+        assert_eq!(default_card_limits_mb(Some(6 * GIB)), (32, 256));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (32, 256));
         assert_eq!(default_card_limits_mb(None), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
 
@@ -5975,4 +6217,126 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod it_dse_tests {
+    use super::OptimalStrideEstimator;
+
+    #[test]
+    fn sparse_small_writes_converge_to_4kib() {
+        let est = OptimalStrideEstimator::new();
+        // Warm up in a large-stride streaming regime first to verify EWMA convergence.
+        for _ in 0..10 {
+            est.observe_commit(4 << 20, &[(0, 4 << 20)]);
+        }
+        assert!(est.optimal_stride() >= (64 << 10));
+
+        // Feed 40 commits of sparse 64-byte writes across a 256 KiB buffer.
+        let sparse_runs: Vec<(usize, usize)> = (0..128).map(|i| (i * 2048, i * 2048 + 64)).collect();
+        for _ in 0..40 {
+            est.observe_commit(256 << 10, &sparse_runs);
+        }
+        let stride = est.optimal_stride();
+        assert!(stride.is_power_of_two());
+        assert_eq!(stride, 4 << 10);
+    }
+
+    #[test]
+    fn dense_large_streaming_writes_converge_to_64kib_to_256kib() {
+        let sparse_runs: Vec<(usize, usize)> = (0..128).map(|i| (i * 2048, i * 2048 + 64)).collect();
+        for (buf_bytes, expected_stride) in [
+            (1u64 << 20, 64usize << 10),
+            (4u64 << 20, 128usize << 10),
+            (16u64 << 20, 256usize << 10),
+        ] {
+            let est = OptimalStrideEstimator::new();
+            // Warm up in the 4 KiB sparse regime first to verify upward convergence.
+            for _ in 0..10 {
+                est.observe_commit(256 << 10, &sparse_runs);
+            }
+            assert_eq!(est.optimal_stride(), 4 << 10);
+
+            for _ in 0..30 {
+                est.observe_commit(buf_bytes, &[(0, buf_bytes as usize)]);
+            }
+            let stride = est.optimal_stride();
+            assert!(stride.is_power_of_two());
+            assert!(
+                ((64 << 10)..=(256 << 10)).contains(&stride),
+                "expected 64..=256 KiB for {buf_bytes} B streaming writes, got {stride}"
+            );
+            assert_eq!(stride, expected_stride);
+        }
+    }
+
+    #[test]
+    fn zero_and_degenerate_inputs_never_panic_and_stay_clamped_power_of_two() {
+        let est = OptimalStrideEstimator::new();
+        let initial = est.optimal_stride();
+        assert!(initial.is_power_of_two());
+        assert!((4096..=262144).contains(&initial));
+
+        // Degenerate commit batches.
+        est.observe_commit(0, &[]);
+        est.observe_commit(0, &[(0, 4096)]);
+        est.observe_commit(65536, &[]);
+        est.observe_commit(65536, &[(1024, 1024), (2048, 1024)]);
+
+        // Degenerate direct observations (zero, negative, NaN, infinities).
+        let bad_samples = [
+            (0.0f32, 0.0f32),
+            (0.0, 1024.0),
+            (0.5, 0.0),
+            (-0.25, 64.0),
+            (0.25, -64.0),
+            (f32::NAN, 64.0),
+            (0.5, f32::NAN),
+            (f32::INFINITY, 64.0),
+            (0.5, f32::INFINITY),
+            (f32::NEG_INFINITY, f32::NEG_INFINITY),
+        ];
+        for (p, r) in bad_samples {
+            est.observe(p, r);
+            let stride = est.optimal_stride();
+            assert!(stride.is_power_of_two(), "not power of two for ({p}, {r}): {stride}");
+            assert!((4096..=262144).contains(&stride), "out of bounds for ({p}, {r}): {stride}");
+        }
+
+        // Direct closed-form sweep across extreme and degenerate values.
+        let test_p = [
+            0.0f64,
+            -0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE,
+            1e-9,
+            1e-3,
+            0.5,
+            1.0,
+            10.0,
+        ];
+        let test_r = [
+            0.0f64,
+            -0.0,
+            -16.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1.0,
+            64.0,
+            4096.0,
+            1_048_576.0,
+            f64::MAX,
+        ];
+        for p in test_p {
+            for r in test_r {
+                let stride = OptimalStrideEstimator::compute_optimal_stride(p, r);
+                assert!(stride.is_power_of_two(), "not power of two for ({p}, {r}): {stride}");
+                assert!((4096..=262144).contains(&stride), "out of bounds for ({p}, {r}): {stride}");
+            }
+        }
+    }
 }

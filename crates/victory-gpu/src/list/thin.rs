@@ -71,6 +71,13 @@ pub(super) struct Front {
 impl Drop for Front {
     fn drop(&mut self) {
         self.leave();
+        let words = std::mem::take(&mut self.words);
+        if words.capacity() > 0 && words.capacity() <= 16 * CHUNK {
+            let mut pool = held(&WORDS);
+            if pool.len() < 256 {
+                pool.push(words);
+            }
+        }
     }
 }
 
@@ -90,6 +97,9 @@ impl Front {
     /// Begins a recording, with `pipeline` bound.
     pub(super) fn begin(&mut self, kind: u32, pipeline: This) {
         self.leave();
+        if self.words.capacity() == 0 {
+            self.words = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
+        }
         self.recording = Some(Arc::new(Recording::new(kind)));
         self.closed = false;
         self.submitted = false;
@@ -101,6 +111,7 @@ impl Front {
         if self.closed || self.recording.is_none() {
             return;
         }
+        self.words.reserve(1 + args.len());
         self.words.push(op | (args.len() as u64) << 16);
         self.words.extend_from_slice(args);
         if self.words.len() >= CHUNK {
@@ -113,10 +124,15 @@ impl Front {
         if self.closed || self.recording.is_none() {
             return;
         }
-        let at = self.words.len();
-        self.words.push(0);
+        let blob_words: usize = blobs.iter().map(|b| b.len().div_ceil(8)).sum();
+        let len = args.len() + blob_words;
+        self.words.reserve(1 + len);
+        self.words.push(op | (len as u64) << 16);
         self.words.extend_from_slice(args);
         for blob in blobs {
+            if blob.is_empty() {
+                continue;
+            }
             let from = self.words.len();
             self.words.resize(from + blob.len().div_ceil(8), 0);
             // SAFETY: the words just made hold the bytes; plain data.
@@ -124,8 +140,6 @@ impl Front {
                 std::ptr::copy_nonoverlapping(blob.as_ptr(), self.words.as_mut_ptr().add(from).cast(), blob.len())
             };
         }
-        let len = (self.words.len() - at - 1) as u64;
-        self.words[at] = op | len << 16;
         if self.words.len() >= CHUNK {
             self.hand_over();
         }
@@ -220,6 +234,9 @@ impl Recording {
 
     /// Waits until it is translated.
     pub(crate) fn wait(&self) {
+        if self.done() {
+            return;
+        }
         let mut inner = held(&self.inner);
         while !self.done() {
             inner = self.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
@@ -287,22 +304,32 @@ impl Drop for Recording {
         for chunk in &inner.chunks {
             drop_uploads(chunk);
         }
-        give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
+        if !inner.chunks.is_empty() || !inner.kept.is_empty() {
+            give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)));
+        }
         if inner.back != 0 {
             if !inner.closed {
                 // Left in the middle.
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            let mut backs = held(&BACKS);
+            if backs.len() < thin_threads() * 4 {
+                backs.push(inner.back);
+            } else {
+                drop(backs);
+                // SAFETY: `inner.back` was created by `Box::into_raw(super::boxed(...))` in
+                // `back_list` and is exclusively owned by this `Recording` on drop.
+                drop(unsafe { Box::from_raw(inner.back as *mut List) });
+            }
         }
     }
 }
 
-fn give_back(streams: Vec<Vec<u64>>) {
+fn give_back(streams: impl IntoIterator<Item = Vec<u64>>) {
     let mut words = held(&WORDS);
     for mut s in streams {
-        if words.len() < 1024 && s.capacity() <= 16 * CHUNK {
+        if words.len() < 256 && s.capacity() <= 16 * CHUNK {
             s.clear();
             words.push(s);
         }
@@ -321,8 +348,20 @@ fn back_list(kind: u32) -> This {
     list
 }
 
+fn thin_threads() -> usize {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        let default = (std::thread::available_parallelism().map_or(4, |n| n.get()) / 2).clamp(2, 6);
+        std::env::var("VICTORY_THIN_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(default)
+            .clamp(1, 32)
+    })
+}
+
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    let threads = thin_threads();
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
@@ -352,17 +391,20 @@ fn start() {
 /// The recordings of submitted lists, in order (one that was not begun is left
 /// out).
 pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
-    lists
-        .iter()
-        .filter(|l| !l.is_null())
-        .filter_map(|&l| {
-            // SAFETY: the title passes its lists, which nobody records into now.
-            let front = unsafe { &mut (*l.cast_mut().cast::<List>()).thin };
-            front.close();
-            front.submitted = true;
-            front.recording.clone()
-        })
-        .collect()
+    let mut out = Vec::with_capacity(lists.len());
+    for &l in lists {
+        if l.is_null() {
+            continue;
+        }
+        // SAFETY: the title passes its lists, which nobody records into now.
+        let front = unsafe { &mut (*l.cast_mut().cast::<List>()).thin };
+        front.close();
+        front.submitted = true;
+        if let Some(recording) = front.recording.clone() {
+            out.push(recording);
+        }
+    }
+    out.into()
 }
 
 /// For the frame-rate line.
@@ -370,7 +412,7 @@ pub(crate) fn line(frames: f64) {
     if !wanted() || !on() {
         return;
     }
-    let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    let s = std::array::from_fn::<f64, 4, _>(|i| STATS[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
         "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}",
         s[0],
@@ -540,16 +582,22 @@ fn at_or<T>(w: &[u64], from: usize) -> *const T {
     unsafe { w.as_ptr().add(from.min(w.len())).cast() }
 }
 
+/// Copies a non-null view's record into `dst` (which must be zeroed and of length `RECORD`).
+#[inline]
+fn write_record(handle: u64, dst: &mut [u64]) {
+    if handle != 0 {
+        // SAFETY: a descriptor slot the title passes (they are larger), and `dst` holds `RECORD` u64s.
+        unsafe {
+            std::ptr::copy_nonoverlapping(handle as *const u8, dst.as_mut_ptr().cast(), size_of::<RtvRecord>())
+        };
+    }
+}
+
 /// A view's record as it is now (zeros for no view), so that its slot may be
 /// written again: the copy stands for the handle.
 fn record(handle: u64) -> [u64; RECORD] {
     let mut words = [0u64; RECORD];
-    if handle != 0 {
-        // SAFETY: a descriptor slot the title passes (they are larger).
-        unsafe {
-            std::ptr::copy_nonoverlapping(handle as *const u8, words.as_mut_ptr().cast(), size_of::<RtvRecord>())
-        };
-    }
+    write_record(handle, &mut words);
     words
 }
 const RECORD: usize = size_of::<RtvRecord>().div_ceil(8);
@@ -653,9 +701,9 @@ extern "system" fn targets(this: This, count: u32, handles: *const u64, one_rang
         // of views of 128 bytes.
         let handle = unsafe { if one_range != 0 { *handles + 128 * i as u64 } else { *handles.add(i) } };
         present |= u64::from(handle != 0) << i;
-        records[i * RECORD..(i + 1) * RECORD].copy_from_slice(&record(handle));
+        write_record(handle, &mut records[i * RECORD..(i + 1) * RECORD]);
     }
-    records[count * RECORD..(count + 1) * RECORD].copy_from_slice(&record(depth));
+    write_record(depth, &mut records[count * RECORD..(count + 1) * RECORD]);
     let records = &records[..(count + 1) * RECORD];
     front(this).put_with(
         TARGETS,

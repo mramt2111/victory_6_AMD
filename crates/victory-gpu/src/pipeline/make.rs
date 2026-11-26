@@ -21,9 +21,9 @@
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -31,8 +31,8 @@ use super::host::{GraphicsState, HostPipeline};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
-    shaders: Vec<Arc<Shader>>,
-    pub(crate) graphics: Option<Box<GraphicsState>>,
+    shaders: Mutex<Option<Vec<Arc<Shader>>>>,
+    pub(crate) graphics: Mutex<Option<Box<GraphicsState>>>,
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
@@ -46,6 +46,10 @@ pub(crate) struct Pending {
     screen: bool,
     /// Confirmed first-scene / bake producer prepared early even on a cold cache.
     scene_input: bool,
+    /// Whether this pipeline writes depth only (shadow maps / depth prepasses).
+    depth_only: bool,
+    /// Whether this pipeline was created with at least one shader stage.
+    has_shaders: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
 }
@@ -115,6 +119,8 @@ impl Pending {
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         let scene_input = scene_input(&shaders);
+        let depth_only = graphics.as_ref().is_some_and(|state| writes_depth_only(state));
+        let has_shaders = !shaders.is_empty();
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
@@ -122,9 +128,11 @@ impl Pending {
         Pending {
             screen,
             scene_input,
+            depth_only,
+            has_shaders,
             left_out,
-            shaders,
-            graphics,
+            shaders: Mutex::new(Some(shaders)),
+            graphics: Mutex::new(graphics),
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
@@ -142,18 +150,42 @@ impl Pending {
         // crashed under stays inside the call for good (see [`guard_start`]),
         // and anyone else asking would wait for it forever.
         if self.made.get().is_none() {
+            let shaders = self
+                .shaders
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or_default();
+            let graphics = self
+                .graphics
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
             let made = if is_bad_key(&self.key) {
                 SKIPPED_BAD.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(key = self.key, shaders = ?self.shaders, "not made: the driver's compiler crashed on it before");
+                tracing::warn!(key = self.key, shaders = ?shaders, "not made: the driver's compiler crashed on it before");
                 None
             } else {
                 let _building = crate::timeline::span("pipeline: build a host pipeline");
                 let began = Instant::now();
-                let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-                super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+                let made = HostPipeline::new(&shaders, graphics.as_deref());
+                let elapsed = began.elapsed();
+                super::library::note_time(&self.key, elapsed.as_millis() as u64);
+                if predict_pso_on()
+                    && let Some(key) = parse_key_u64(&self.key)
+                {
+                    super::known::record_compile_ms(key, elapsed.as_secs_f32() * 1_000.0);
+                }
                 made
             };
+            let succeeded = made.is_some();
             let _ = self.made.set(made);
+            // Release compile-only inputs once the PSO is built; keep `shaders`
+            // only on failure so `missing` / `hashes` diagnostics stay intact.
+            drop(graphics);
+            if succeeded {
+                let _ = self.shaders.lock().unwrap_or_else(|e| e.into_inner()).take();
+            }
         }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -348,9 +380,15 @@ fn lost(slot: usize) {
     let Some((p, screens_only)) = job else {
         return;
     };
+    let shaders = p
+        .shaders
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default();
     tracing::error!(
         key = p.key,
-        shaders = ?p.shaders,
+        shaders = ?shaders,
         rip = format_args!("{:#x}", FAULT_RIP[slot].load(Ordering::Relaxed)),
         address = format_args!("{:#x}", FAULT_ADDR[slot].load(Ordering::Relaxed)),
         "the driver's compiler crashed making a pipeline: it is left out, the worker is replaced"
@@ -360,7 +398,7 @@ fn lost(slot: usize) {
         use std::io::Write;
         let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("warm-bad.txt"));
         if let Ok(mut f) = file {
-            let _ = writeln!(f, "{} ended the compiler in a run: {:?}", p.key, p.shaders);
+            let _ = writeln!(f, "{} ended the compiler in a run: {:?}", p.key, shaders);
         }
     }
     let _ = p.made.set(None);
@@ -390,14 +428,15 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
         Some(Some(_)) => None,
         None => Some("being made".into()),
         Some(None) => {
-            let failed: Vec<String> = p
-                .shaders
+            let guard = p.shaders.lock().unwrap_or_else(|e| e.into_inner());
+            let shaders = guard.as_deref().unwrap_or(&[]);
+            let failed: Vec<String> = shaders
                 .iter()
                 .filter(|s| matches!(s.translated.get(), Some(None)))
                 .map(|s| format!("{} {}", s.stage, s.hash))
                 .collect();
             Some(if failed.is_empty() {
-                format!("refused {:?}", p.shaders)
+                format!("refused {:?}", shaders)
             } else {
                 failed.join(" + ")
             })
@@ -407,7 +446,9 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 
 /// The hashes of the shaders `p` is made of.
 pub(crate) fn hashes(p: &Pending) -> String {
-    let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();
+    let guard = p.shaders.lock().unwrap_or_else(|e| e.into_inner());
+    let shaders = guard.as_deref().unwrap_or(&[]);
+    let hashes: Vec<&str> = shaders.iter().map(|s| s.hash.as_str()).collect();
     hashes.join("+")
 }
 
@@ -450,6 +491,88 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
+/// Whether predictive PSO co-occurrence pre-warming is enabled
+/// (`VICTORY_PREDICT_PSO=0`: disabled).
+fn predict_pso_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PREDICT_PSO").is_none_or(|v| v != "0"))
+}
+
+/// Bounded weak registry of created `Pending` PSOs by 64-bit key.
+/// Uses `Weak<Pending>` so it never keeps unused PSOs alive.
+const PENDING_MAP_CAP: usize = 8_192;
+static PENDING_BY_KEY: Mutex<Option<HashMap<u64, Weak<Pending>>>> = Mutex::new(None);
+
+fn parse_key_u64(key: &str) -> Option<u64> {
+    key.get(..16).and_then(|hex| u64::from_str_radix(hex, 16).ok())
+}
+
+fn key_u64(key: &str) -> u64 {
+    if let Some(v) = parse_key_u64(key) {
+        return v;
+    }
+    let hash = blake3::hash(key.as_bytes());
+    let b = hash.as_bytes();
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+fn register_pending(p: &Arc<Pending>) {
+    if !predict_pso_on() || p.left_out.is_some() || !p.has_shaders {
+        return;
+    }
+    let key = key_u64(&p.key);
+    let mut guard = PENDING_BY_KEY.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if map.len() >= PENDING_MAP_CAP && !map.contains_key(&key) {
+        map.retain(|_, w| w.strong_count() > 0);
+        if map.len() >= PENDING_MAP_CAP {
+            return;
+        }
+    }
+    let _ = map.insert(key, Arc::downgrade(p));
+}
+
+fn predict_and_prewarm(p: &Arc<Pending>) {
+    if !predict_pso_on() || !p.has_shaders {
+        return;
+    }
+    let key = key_u64(&p.key);
+    super::known::record_draw_key(key);
+    let neighbor_keys = super::known::predicted_neighbors(key, 4);
+    if neighbor_keys.is_empty() {
+        return;
+    }
+    let candidates: Vec<Arc<Pending>> = {
+        let mut guard = PENDING_BY_KEY.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = guard.as_mut() else {
+            return;
+        };
+        let mut live = Vec::with_capacity(neighbor_keys.len());
+        for nk in neighbor_keys {
+            if nk == key {
+                continue;
+            }
+            if let Some(weak) = map.get(&nk) {
+                if let Some(arc) = weak.upgrade() {
+                    live.push(arc);
+                } else {
+                    let _ = map.remove(&nk);
+                }
+            }
+        }
+        live
+    };
+    for neighbor in candidates {
+        if neighbor.left_out.is_none()
+            && neighbor.has_shaders
+            && neighbor.made.get().is_none()
+            && neighbor.queue_state.load(Ordering::Relaxed) == NOT_QUEUED
+        {
+            start(&neighbor, EARLY);
+        }
+    }
+}
+
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
@@ -460,7 +583,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        register_pending(p);
     }
+    predict_and_prewarm(p);
     if p.made.get().is_none() {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
@@ -485,7 +610,8 @@ pub(crate) fn early(p: &Arc<Pending>) {
     if p.left_out.is_some() {
         return;
     }
-    if !p.shaders.is_empty() && (p.scene_input || super::library::wanted_early(&p.key)) {
+    register_pending(p);
+    if p.has_shaders && (p.scene_input || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, if p.scene_input { REQUESTED } else { EARLY });
     }
@@ -543,10 +669,13 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     if screen && waited > Duration::from_millis(500) {
+        let guard = p.shaders.lock().unwrap_or_else(|e| e.into_inner());
+        let shaders = guard.as_deref().unwrap_or(&[]);
         tracing::info!(
             ms = waited.as_millis() as u64,
             made = p.made.get().is_some(),
-            shaders = ?p.shaders,
+            key = p.key,
+            shaders = ?shaders,
             "a pass over the screen was waited for (VICTORY_SCREEN_WAIT_MS=0: dropped past half a second a frame)"
         );
     }
@@ -586,8 +715,16 @@ fn slow_limit() -> usize {
     *LIMIT.get_or_init(|| {
         if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
             usize::MAX
+        } else if crate::residency::low_end_ram() {
+            1
         } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
+            let workers = worker_count_for(
+                None,
+                std::thread::available_parallelism().map_or(2, |n| n.get()),
+                crate::residency::limited_host_ram(),
+                crate::residency::low_end_cpu(),
+            );
+            (workers / 4).max(1)
         }
     })
 }
@@ -613,7 +750,12 @@ struct Queue {
     /// being made ([`slow_limit`]).
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
+    /// Requested fast draws/dispatches: always drained before `requested_slow`
+    /// so a multi-second known-slow compile never blocks fast draws behind it.
     requested: VecDeque<Arc<Pending>>,
+    /// Requested pipelines known to take long: drained after fast `requested`
+    /// work and before unrequested prewarming, without being capped by `slow_limit`.
+    requested_slow: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
@@ -625,6 +767,7 @@ impl Queue {
             slow: VecDeque::new(),
             slow_now: 0,
             requested: VecDeque::new(),
+            requested_slow: VecDeque::new(),
         }
     }
 
@@ -643,10 +786,14 @@ impl Queue {
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
-            self.requested.push_back(p.clone());
+            if slow {
+                self.requested_slow.push_back(p.clone());
+            } else {
+                self.requested.push_back(p.clone());
+            }
         } else if slow {
             self.slow.push_back(p.clone());
-        } else if p.graphics.as_ref().is_some_and(|state| writes_depth_only(state)) {
+        } else if p.depth_only {
             self.early_depth.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
@@ -664,6 +811,7 @@ impl Queue {
             p = self
                 .requested
                 .pop_front()
+                .or_else(|| self.requested_slow.pop_front())
                 .or_else(|| unclaimed(&mut self.early_depth))
                 .or_else(|| unclaimed(&mut self.early));
             if p.is_none() && self.slow_now < slow_limit {
@@ -682,6 +830,7 @@ impl Queue {
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
+static SCREEN_AVAILABLE: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -700,9 +849,12 @@ fn start(p: &Arc<Pending>, priority: u8) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
-        // (One woken could be a worker that takes passes over the screen
-        // alone: it would leave the pipeline to nobody.)
-        AVAILABLE.notify_all();
+        if priority == REQUESTED && p.screen && screens_first() {
+            SCREEN_AVAILABLE.notify_all();
+            AVAILABLE.notify_all();
+        } else {
+            AVAILABLE.notify_one();
+        }
     }
 }
 
@@ -715,7 +867,12 @@ fn next(screens_only: bool) -> Arc<Pending> {
         if let Some(p) = queue.pop(screens_only, slow_limit()) {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        queue = if screens_only {
+            SCREEN_AVAILABLE.wait(queue)
+        } else {
+            AVAILABLE.wait(queue)
+        }
+        .unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -723,12 +880,13 @@ fn next(screens_only: bool) -> Arc<Pending> {
 /// 64), else two thirds of the logical processors, 2 to 16. They run below the
 /// title's own threads, and a cold cache queues hundreds at once.
 fn worker_count(asked: Option<usize>, processors: usize) -> usize {
-    worker_count_for(asked, processors, false)
+    worker_count_for(asked, processors, false, false)
 }
 
-fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool) -> usize {
+fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool, low_end: bool) -> usize {
     match asked {
         Some(n) => n.clamp(1, 64),
+        None if low_end => (processors / 2).clamp(1, 4),
         None if limited_ram => (processors * 3 / 4).clamp(2, 8),
         None => (processors * 2 / 3).clamp(2, 16),
     }
@@ -739,15 +897,21 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
+        let low_end = crate::residency::low_end_ram() || crate::residency::low_end_cpu();
         let workers = worker_count_for(
             std::env::var("VICTORY_PIPELINE_WORKERS")
                 .ok()
                 .and_then(|v| v.trim().parse().ok()),
             std::thread::available_parallelism().map_or(2, |n| n.get()),
             crate::residency::limited_host_ram(),
+            low_end,
         );
         tracing::info!(workers, "pipeline workers");
-        let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+        let screens = if screens_first() {
+            if low_end { 1 } else { SCREEN_WORKERS }
+        } else {
+            0
+        };
         guard_start();
         for i in 0..workers + screens {
             if spawn_worker(i >= workers) {
@@ -833,10 +997,13 @@ mod tests {
         assert_eq!(worker_count(None, 64), 16);
         assert_eq!(worker_count(Some(0), 24), 1);
         assert_eq!(worker_count(Some(20), 24), 20);
-        assert_eq!(worker_count_for(None, 8, true), 6);
-        assert_eq!(worker_count_for(None, 16, true), 8);
-        assert_eq!(worker_count_for(None, 24, true), 8);
-        assert_eq!(worker_count_for(Some(12), 8, true), 12);
+        assert_eq!(worker_count_for(None, 8, true, false), 6);
+        assert_eq!(worker_count_for(None, 16, true, false), 8);
+        assert_eq!(worker_count_for(None, 24, true, false), 8);
+        assert_eq!(worker_count_for(Some(12), 8, true, false), 12);
+        assert_eq!(worker_count_for(None, 2, true, true), 1);
+        assert_eq!(worker_count_for(None, 8, true, true), 4);
+        assert_eq!(worker_count_for(None, 16, false, true), 4);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
@@ -962,5 +1129,45 @@ mod tests {
             assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), expected));
         }
         assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn fast_requested_pipelines_precede_slow_requested_pipelines() {
+        let new = || Arc::new(Pending::new(Vec::new(), None));
+        let (slow_req, fast_req, early_fast) = (new(), new(), new());
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_as(&early_fast, EARLY, false), Some(true));
+        assert_eq!(queue.push_as(&slow_req, REQUESTED, true), Some(true));
+        assert_eq!(queue.push_as(&fast_req, REQUESTED, false), Some(true));
+
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &fast_req));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &slow_req));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &early_fast));
+        assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn pending_releases_graphics_state_after_make() {
+        let p = Pending::new(Vec::new(), Some(Box::new(GraphicsState::default())));
+        assert!(p.graphics.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+        p.make();
+        assert!(p.graphics.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+    }
+
+    #[test]
+    fn weak_pending_registry_does_not_retain_dropped_pipelines() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.has_shaders = true;
+        p.key = "0123456789abcdef0000000000000001".to_owned();
+        let key = key_u64(&p.key);
+        assert_eq!(key, 0x0123_4567_89ab_cdef);
+        let arc = Arc::new(p);
+        register_pending(&arc);
+        let weak = Arc::downgrade(&arc);
+        assert!(weak.upgrade().is_some());
+        drop(arc);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(parse_key_u64("0123456789abcdef0000000000000001"), Some(0x0123_4567_89ab_cdef));
+        assert_eq!(parse_key_u64("bad-pipeline-test"), None);
     }
 }

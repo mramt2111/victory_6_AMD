@@ -196,7 +196,7 @@ fn say() {
     if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return;
     }
-    let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    let s: [u64; 8] = std::array::from_fn(|i| STATS[i].load(Ordering::Relaxed));
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
@@ -279,6 +279,8 @@ struct Views {
     /// none), made when first asked for ([`beside`]) and kept refcounted so
     /// unmapping waits until every active reader drops its handle.
     whole: Vec<(usize, std::sync::Arc<WholeView>)>,
+    /// Scratch buffer reused by [`views_gone`] to avoid per-call allocation.
+    gone_scratch: Vec<usize>,
 }
 
 /// Refcounted wrapper around a mapped whole-section view; unmaps when the last
@@ -308,6 +310,7 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     pages_twice: 0,
     sections: Vec::new(),
     whole: Vec::new(),
+    gone_scratch: Vec::new(),
 });
 
 fn views() -> std::sync::RwLockReadGuard<'static, Views> {
@@ -369,28 +372,34 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     let mut v = views_mut();
-    if v.views.is_empty() {
+    let Views { views, pages, pages_twice, gone_scratch, .. } = &mut *v;
+    if views.is_empty() {
         return;
     }
     let end = at.saturating_add(len);
-    let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
-    let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
-    for base in gone {
-        let Some((bytes, section, offset)) = v.views.remove(&base) else {
+    let first = views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
+    gone_scratch.clear();
+    gone_scratch.extend(first.into_iter().chain(views.range(at.saturating_add(1)..end).map(|(base, _)| *base)));
+    for &base in gone_scratch.iter() {
+        let Some((bytes, section, offset)) = views.remove(&base) else {
             continue;
         };
         for k in 0..bytes.div_ceil(K64) {
             let key = (section, offset + (k * K64) as u64);
-            if let Some(pages) = v.pages.get_mut(&key) {
+            if let std::collections::btree_map::Entry::Occupied(mut entry) = pages.entry(key) {
+                let shown_pages = entry.get_mut();
                 let page = base + k * K64;
-                let before = pages.len();
-                pages.retain(|&shown| shown != page);
-                let after = pages.len();
+                let before = shown_pages.len();
+                shown_pages.retain(|&shown| shown != page);
+                let after = shown_pages.len();
                 if after == 0 {
-                    v.pages.remove(&key);
+                    let _ = entry.remove();
                 }
-                v.pages_twice = v.pages_twice.saturating_sub(usize::from(before >= 2 && after < 2));
+                *pages_twice = pages_twice.saturating_sub(usize::from(before >= 2 && after < 2));
             }
         }
     }
@@ -400,9 +409,12 @@ pub(crate) fn views_gone(at: usize, len: usize) {
 /// addresses too, in address order, each with those; not the ones it shows
 /// in very many views (`crate::watch::MANY_VIEWS`).
 pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize>)> {
+    if start >= end {
+        return Vec::new();
+    }
     let v = views();
     let mut out = Vec::new();
-    if start >= end || v.pages_twice == 0 {
+    if v.pages_twice == 0 {
         return out;
     }
     let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
@@ -413,7 +425,13 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
                 continue;
             };
             if (2..=crate::watch::MANY_VIEWS).contains(&shown.len()) {
-                out.push((page, shown.iter().copied().filter(|&at| at != page).collect()));
+                let mut others = Vec::with_capacity(shown.len().saturating_sub(1));
+                for &at in shown {
+                    if at != page {
+                        others.push(at);
+                    }
+                }
+                out.push((page, others));
             }
         }
     }
@@ -441,20 +459,19 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
     if len == 0 {
         return Vec::new();
     }
-    let v = views();
     let end = offset.saturating_add(len as u64);
+    let at = offset & !(K64 as u64 - 1);
     let mut pages: Vec<usize> = Vec::new();
-    let mut at = offset - offset % K64 as u64;
-    while at < end {
-        if let Some(shown) = v.pages.get(&(section, at))
-            && shown.len() <= crate::watch::MANY_VIEWS
-        {
-            pages.extend(shown.iter().copied());
+    {
+        let v = views();
+        for (&(_, page_off), shown) in v.pages.range((section, at)..(section, end)) {
+            if page_off.is_multiple_of(K64 as u64) && shown.len() <= crate::watch::MANY_VIEWS {
+                pages.extend_from_slice(shown);
+            }
         }
-        match at.checked_add(K64 as u64) {
-            Some(next) => at = next,
-            None => break,
-        }
+    }
+    if pages.is_empty() {
+        return Vec::new();
     }
     pages.sort_unstable();
     pages.dedup();
@@ -473,8 +490,14 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
 /// kind). The runtime's own record of what it mapped: no question to the
 /// host.
 pub(crate) fn shown_bytes(at: usize, len: usize) -> Option<u64> {
+    if len == 0 {
+        return None;
+    }
     let end = at.saturating_add(len);
     let v = views();
+    if v.views.is_empty() {
+        return None;
+    }
     let first = v.views.range(..=at).next_back();
     let rest = v.views.range(at.saturating_add(1)..end.max(at.saturating_add(1)));
     let (mut there, mut any) = (0u64, false);
@@ -492,8 +515,14 @@ pub(crate) fn shown_bytes(at: usize, len: usize) -> Option<u64> {
 /// that touch as one: (address, bytes). Empty: nothing, or memory of another
 /// kind.
 pub(crate) fn shown_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
     let end = at.saturating_add(len);
     let v = views();
+    if v.views.is_empty() {
+        return Vec::new();
+    }
     let first = v.views.range(..=at).next_back();
     let rest = v.views.range(at.saturating_add(1)..end.max(at.saturating_add(1)));
     let mut runs: Vec<(usize, usize)> = Vec::new();
@@ -525,18 +554,32 @@ pub(crate) enum Cover {
 }
 
 fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize) -> Cover {
+    if views.is_empty() {
+        return Cover::None;
+    }
     let end = at + len.max(1);
     let Some((&base, &(bytes, section, offset))) = views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at) else {
         return Cover::None;
     };
     let first = (section, offset + (at - base) as u64);
     let (mut reached, mut one) = (base + bytes, true);
-    while reached < end {
-        let Some(&(bytes, s, o)) = views.get(&reached) else {
+    if reached < end {
+        for (&next_base, &(next_bytes, s, o)) in views.range(reached..end) {
+            if next_base < reached {
+                continue;
+            }
+            if next_base > reached {
+                return Cover::Holes;
+            }
+            one &= s == first.0 && o == first.1 + (reached - at) as u64;
+            reached += next_bytes;
+            if reached >= end {
+                break;
+            }
+        }
+        if reached < end {
             return Cover::Holes;
-        };
-        one &= s == first.0 && o == first.1 + (reached - at) as u64;
-        reached += bytes;
+        }
     }
     if one { Cover::Run(first.0, first.1) } else { Cover::Scattered }
 }
@@ -989,16 +1032,23 @@ unsafe fn section(p: &mut Probe, rig: &mut Rig) {
                 let memory = hole.add(K64);
                 fill(memory, 2 * K64, 3);
                 p.section_reads = rig.fetch(buffer, 0, 2 * K64).is_ok_and(|got| same(memory, &got));
-                let new: Vec<u8> = (0..K64).map(|i| (i as u8) ^ 0x33).collect();
+                let mut new = vec![0u8; K64];
+                for (i, b) in new.iter_mut().enumerate() {
+                    *b = (i as u8) ^ 0x33;
+                }
                 p.section_writes = rig.store(buffer, 0, &new).is_ok() && same(memory, &new);
                 // The guard of `watch.rs`: the view read-only.
                 let mut old = 0;
                 let guarded = mem::VirtualProtect(memory.cast(), K64, mem::PAGE_READONLY, &mut old) != 0;
-                let new: Vec<u8> = (0..K64).map(|i| (i as u8) ^ 0x44).collect();
+                for (i, b) in new.iter_mut().enumerate() {
+                    *b = (i as u8) ^ 0x44;
+                }
                 let through = rig.store(buffer, 0, &new).is_ok() && same(memory, &new);
                 // The view goes; the GPU writes; another view shows it.
                 unmapped = mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER) != 0;
-                let new: Vec<u8> = (0..K64).map(|i| (i as u8) ^ 0x55).collect();
+                for (i, b) in new.iter_mut().enumerate() {
+                    *b = (i as u8) ^ 0x55;
+                }
                 let stored = rig.store(buffer, 0, &new).is_ok();
                 let other = mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, (5 * K64) as u32, K64);
                 p.section_outlives_views = unmapped && stored && !other.Value.is_null() && same(other.Value.cast(), &new);
@@ -1151,7 +1201,7 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         tally.0[kind].0 += 1;
         tally.0[kind].1 += len;
     }
-    let mut lines = Vec::new();
+    let mut lines = Vec::with_capacity(16);
     for (name, tally) in [("title buffers", buffers), ("windows outside buffers", windows)] {
         let all = tally.0.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
         lines.push(format!("census, {name}: {} of {} MB", all.0, all.1 >> 20));
@@ -1162,9 +1212,15 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         }
     }
     let v = views();
-    let (count, bytes) = (v.views.len(), v.views.values().map(|view| view.0 as u64).sum::<u64>());
-    let pages = v.views.values().filter(|view| view.0 == K64).count();
-    let big = v.views.values().map(|view| view.0).max().unwrap_or(0);
+    let count = v.views.len();
+    let (mut bytes, mut pages, mut big) = (0u64, 0usize, 0usize);
+    for view in v.views.values() {
+        bytes += view.0 as u64;
+        if view.0 == K64 {
+            pages += 1;
+        }
+        big = big.max(view.0);
+    }
     lines.push(format!(
         "census, the title's views of physical pages: {count} of {} MB; {pages} of them one 64 KiB page; the longest {} MB",
         bytes >> 20,
@@ -1192,11 +1248,12 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
         return Vec::new();
     };
     let mut known = Vec::new();
-    let found = spans
-        .iter()
-        .filter(|s| !s.2 && s.1 >= 2 * K64 as u64)
-        .filter(|s| kind_of(s.0 as usize, s.1 as usize, &mut known) == 0)
-        .max_by_key(|s| s.1);
+    let mut found: Option<&(u64, u64, bool)> = None;
+    for s in spans {
+        if !s.2 && s.1 >= 2 * K64 as u64 && found.is_none_or(|b| s.1 >= b.1) && kind_of(s.0 as usize, s.1 as usize, &mut known) == 0 {
+            found = Some(s);
+        }
+    }
     let Some(&(start, len, _)) = found else {
         return vec!["the title's memory: no title buffer in private, committed memory to try".to_owned()];
     };

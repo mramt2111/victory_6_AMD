@@ -243,7 +243,35 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+fn idle_most() -> (usize, u64) {
+    if crate::residency::low_end_ram() {
+        (64, 64 << 20)
+    } else if crate::residency::limited_host_ram() {
+        (128, 128 << 20)
+    } else {
+        (512, 256 << 20)
+    }
+}
+
+/// Drops excess idle host lists when host memory is under pressure.
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    if !crate::residency::pressured() {
+        return;
+    }
+    let dropped: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        while idle.0.len() > 16 {
+            if let Some(entry) = idle.0.pop() {
+                idle.1 = idle.1.saturating_sub(entry.1);
+                out.push(entry);
+            }
+        }
+        out
+    };
+    drop(dropped);
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -277,14 +305,15 @@ pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
 /// kept for [`fresh_list`].
 #[cfg(windows)]
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
-    if !pools() {
+    if lists.is_empty() || ran.is_empty() || !pools() {
         return;
     }
+    let (most_lists, most_bytes) = idle_most();
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most_lists {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -292,7 +321,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < most_lists && idle.1 + bytes <= most_bytes {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
@@ -388,10 +417,13 @@ pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 /// the second naming is dropped (logged once).
 #[cfg(windows)]
 pub(crate) fn detach_parts(lists: &[This]) -> Parts {
+    if lists.is_empty() {
+        return Vec::new();
+    }
     let mut parts: Parts = vec![(Vec::new(), Vec::new(), Vec::new())];
     // The lists taken: where its one host list is (entry, place), or none
     // for a list of several parts.
-    let mut seen: Vec<(This, Option<(usize, usize)>)> = Vec::new();
+    let mut seen: Vec<(This, Option<(usize, usize)>)> = Vec::with_capacity(lists.len());
     for &this in lists {
         if this.is_null() {
             continue;
@@ -425,7 +457,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
         let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
         let single = earlier.is_empty() && gate.is_empty();
-        let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
+        let pieces = earlier
             .into_iter()
             .map(|part| {
                 (
@@ -437,15 +469,14 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                     },
                 )
             })
-            .collect();
-        pieces.push((
-            gate,
-            Detached {
-                host,
-                _uploads: uploads,
-                _state: state,
-            },
-        ));
+            .chain(std::iter::once((
+                gate,
+                Detached {
+                    host,
+                    _uploads: uploads,
+                    _state: state,
+                },
+            )));
         let mut last = None;
         for (waits, detached) in pieces {
             if !waits.is_empty() {
@@ -470,13 +501,17 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 /// its next reset: what was taken, and which of them run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
-    let mut taken: Vec<(This, Detached)> = Vec::new();
-    let mut order = Vec::new();
+    if lists.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut seen: Vec<This> = Vec::with_capacity(lists.len());
+    let mut taken: Vec<Detached> = Vec::with_capacity(lists.len());
+    let mut order = Vec::with_capacity(lists.len());
     for &this in lists {
         if this.is_null() {
             continue;
         }
-        if let Some(i) = taken.iter().position(|(t, _)| *t == this) {
+        if let Some(i) = seen.iter().position(|&t| t == this) {
             order.push(i);
             continue;
         }
@@ -500,16 +535,14 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             (host, uploads, state)
         };
         order.push(taken.len());
-        taken.push((
-            this,
-            Detached {
-                host,
-                _uploads: uploads,
-                _state: state,
-            },
-        ));
+        seen.push(this);
+        taken.push(Detached {
+            host,
+            _uploads: uploads,
+            _state: state,
+        });
     }
-    (taken.into_iter().map(|(_, d)| d).collect(), order)
+    (taken, order)
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -809,21 +842,25 @@ fn scoped_uav_barriers() -> bool {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if count > 0
         && !barriers.is_null()
+        && let Some(list) = host_list(this)
     {
-        if count > 0 {
-            with_state(this, |_, state| state.synced());
-        }
+        with_state(this, |_, state| state.synced());
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut keep = Vec::new();
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b, &mut keep))
-            .collect();
+        let mut host = Vec::with_capacity(barriers.len());
+        let mut has_global_uav = false;
+        for b in barriers {
+            if let Some(hb) = host_barrier(list, b, &mut keep) {
+                if hb.kind == 2 && hb.first.is_null() {
+                    has_global_uav = true;
+                }
+                host.push(hb);
+            }
+        }
         if scoped_uav_barriers() {
-            let has_global_uav = host.iter().any(|b| b.kind == 2 && b.first.is_null());
             if !has_global_uav {
                 let mut scoped: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
                 let mut any_buffer = false;
@@ -851,6 +888,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 }
                 if any_buffer {
                     if all_resolved && !scoped.is_empty() {
+                        host.reserve(scoped.len());
                         for shadow in scoped {
                             let raw = windows::core::Interface::as_raw(&shadow.buffer)
                                 .cast_const()
@@ -952,7 +990,8 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if len > 0
+        && let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
@@ -1526,7 +1565,8 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if len > 0
+        && let Some(list) = host_list(this)
         && dst != 0
         && src != 0
     {
@@ -1584,6 +1624,9 @@ extern "system" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
+    if count == 0 {
+        return;
+    }
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
@@ -1905,16 +1948,30 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
-            // SAFETY: the title passes the first handle.
-            let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
-        } else {
-            items(handles, count).to_vec()
-        };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        if count == 0 || handles.is_null() {
+            with_state(this, |list, s| s.set_targets(list, &[], depth));
+            return;
+        }
+        if one_range != 0 {
+            // SAFETY: the title passes the first handle.
+            let first = unsafe { *handles };
+            let n = count as usize;
+            if n <= 8 {
+                let mut range = [0u64; 8];
+                for (i, slot) in range[..n].iter_mut().enumerate() {
+                    *slot = first + 128 * (i as u64);
+                }
+                with_state(this, |list, s| s.set_targets(list, &range[..n], depth));
+            } else {
+                let range: Vec<u64> = (0..u64::from(count)).map(|i| first + 128 * i).collect();
+                with_state(this, |list, s| s.set_targets(list, &range, depth));
+            }
+        } else {
+            let slice = items(handles, count);
+            with_state(this, |list, s| s.set_targets(list, slice, depth));
+        }
     }
     pub(super) extern "system" fn draw(
         this: This,
@@ -2198,6 +2255,9 @@ static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex
 /// shortcut: a wait holds its whole list (and submission) back, not only
 /// the commands after it.
 pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
+    if lists.is_empty() {
+        return Vec::new();
+    }
     let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
     let mut unmet = Vec::new();
     waits.retain(|&(list, wait)| {
@@ -2216,8 +2276,14 @@ pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
 /// met or not, at the list's first place in the submission.
 #[cfg(windows)]
 pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
-    let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    if lists.is_empty() {
+        return Vec::new();
+    }
     let mut by = vec![Vec::new(); lists.len()];
+    let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    if waits.is_empty() {
+        return by;
+    }
     waits.retain(|&(list, wait)| {
         match lists.iter().position(|&l| l as usize == list) {
             Some(i) => {

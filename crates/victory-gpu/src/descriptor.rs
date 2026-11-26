@@ -95,7 +95,7 @@ impl Heap {
             .get_or_init(|| {
                 let step = u64::from(increment(self.desc.kind)?);
                 let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
-                for i in pending.drain(..) {
+                for i in std::mem::take(&mut *pending) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
                 Some(h)
@@ -149,6 +149,12 @@ fn mirror(handle: u64) {
     let Some(index) = heap.index(handle) else {
         return;
     };
+    if let Some(host) = heap.host.get() {
+        if let Some(host) = host {
+            host.mirror(index, handle, false);
+        }
+        return;
+    }
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -156,6 +162,98 @@ fn mirror(handle: u64) {
             drop(pending);
             if let Some(host) = host {
                 host.mirror(index, handle, false);
+            }
+        }
+    }
+}
+
+/// Mirrors `count` consecutive descriptors of stride `step` starting at `dst`,
+/// holding `SHADER_HEAPS` once for the entire range.
+#[cfg(windows)]
+fn mirror_range(dst: u64, count: u32, step: u64) {
+    if count == 0 {
+        return;
+    }
+    if count == 1 {
+        mirror(dst);
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    if heaps.is_empty() {
+        return;
+    }
+    let total_bytes = u64::from(count) * step;
+    if let Some(&(_, end, at)) = heaps
+        .iter()
+        .find(|&&(start, end, _)| (start..end).contains(&dst))
+    {
+        // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+        // the `SHADER_HEAPS` lock we hold here.
+        let heap = unsafe { &*(at as *const Heap) };
+        if dst.checked_add(total_bytes).is_some_and(|re| re <= end)
+            && increment(heap.desc.kind).map(u64::from) == Some(step)
+            && let Some(first) = heap.index(dst)
+            && u64::from(first) + u64::from(count) <= u64::from(heap.desc.count)
+        {
+            if let Some(host) = heap.host.get() {
+                if let Some(host) = host {
+                    for i in 0..count {
+                        host.mirror(first + i, dst + u64::from(i) * step, false);
+                    }
+                }
+                return;
+            }
+            let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+            match heap.host.get() {
+                None => {
+                    pending.reserve(count as usize);
+                    pending.extend(first..first + count);
+                }
+                Some(host) => {
+                    drop(pending);
+                    if let Some(host) = host {
+                        for i in 0..count {
+                            host.mirror(first + i, dst + u64::from(i) * step, false);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    } else if !heaps
+        .iter()
+        .any(|&(start, end, _)| dst < end && start < dst.saturating_add(total_bytes))
+    {
+        return;
+    }
+    for i in 0..u64::from(count) {
+        let handle = dst + i * step;
+        let Some(&(_, _, at)) = heaps
+            .iter()
+            .find(|&&(start, end, _)| (start..end).contains(&handle))
+        else {
+            continue;
+        };
+        // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+        // the `SHADER_HEAPS` lock we hold here.
+        let heap = unsafe { &*(at as *const Heap) };
+        let Some(index) = heap.index(handle) else {
+            continue;
+        };
+        if let Some(host) = heap.host.get() {
+            if let Some(host) = host {
+                host.mirror(index, handle, false);
+            }
+            continue;
+        }
+        let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match heap.host.get() {
+            None => pending.push(index),
+            Some(host) => {
+                drop(pending);
+                if let Some(host) = host {
+                    host.mirror(index, handle, false);
+                }
             }
         }
     }
@@ -397,32 +495,47 @@ pub(crate) fn sync_heaps() {
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);
-        let of_tables = std::sync::atomic::AtomicU64::new(0);
-        crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
-                if host.copied_tabled(index, frame) {
-                    of_tables.fetch_add(1, Relaxed);
-                } else {
-                    host.mirror(index, start + u64::from(index) * step, false);
+        if !before.is_empty() {
+            let of_tables = std::sync::atomic::AtomicU64::new(0);
+            crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
+                let mut local_tabled = 0u64;
+                for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+                    if host.copied_tabled(index, frame) {
+                        local_tabled += 1;
+                    } else {
+                        host.mirror(index, start + u64::from(index) * step, false);
+                    }
                 }
-            }
-        });
-        let of_tables = of_tables.into_inner();
-        tabled += of_tables;
-        mirrored += before.len() as u64 - of_tables;
-        kinds[4] += before.len() as u64 - of_tables;
+                if local_tabled > 0 {
+                    of_tables.fetch_add(local_tabled, Relaxed);
+                }
+            });
+            let of_tables = of_tables.into_inner();
+            tabled += of_tables;
+            mirrored += before.len() as u64 - of_tables;
+            kinds[4] += before.len() as u64 - of_tables;
+        }
         // Those of the changed pages, made together at the end.
-        let mut make: Vec<u32> = Vec::new();
         let began = std::time::Instant::now();
         let taken = written.take(start as usize, end as usize);
         spent[0] += since(began);
-        let mut parts: Vec<(usize, usize)> = Vec::new();
+        if taken.is_empty() {
+            continue;
+        }
+        let page_cap: usize = taken
+            .iter()
+            .map(|&(from, to)| to.saturating_sub(from).div_ceil(crate::watch::PAGE))
+            .sum();
+        let mut parts: Vec<(usize, usize)> = Vec::with_capacity(page_cap);
         for (range_from, range_end) in taken {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
                 page += crate::watch::PAGE;
             }
+        }
+        if parts.is_empty() {
+            continue;
         }
         // A few pages a thread at a time: read, compared with what was last
         // seen there and sorted out, beside one another (14 ms a frame of one
@@ -431,7 +544,7 @@ pub(crate) fn sync_heaps() {
         let copied = host.copied_begin(step as usize);
         let samplers = heap.samplers();
         let in_place = sync_in_place() && step == 32 && crate::safecopy::on();
-        let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(SYNC_PAGES).map(|_| Default::default()).collect();
+        let mut found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(SYNC_PAGES).map(|_| Default::default()).collect();
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
             let mut page_bytes: Vec<u8> = Vec::new();
@@ -495,7 +608,9 @@ pub(crate) fn sync_heaps() {
                             .and_then(|b| b.try_into().ok())
                             .map_or(0, u32::from_le_bytes)
                     };
-                    if !samplers && word(0) == VIEW_TAG {
+                    let is_view = word(0) == VIEW_TAG;
+                    let w2_kind = if !samplers && is_view { word(2) >> KIND_SHIFT } else { 0 };
+                    if !samplers && is_view {
                         // A draw's own table: the draw makes what it
                         // reads of it (`draw.rs` `tables`).
                         if host.copied_tabled(index, frame) {
@@ -506,7 +621,7 @@ pub(crate) fn sync_heaps() {
                         // slot from this anyway, they wait for a draw
                         // or a pass: noted some frames on, unless a
                         // draw's table turns out to hold them.
-                        if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
+                        if matches!(w2_kind, CONSTANT | PLACED) && host.copied_waits() {
                             out.wait.push(index);
                             continue;
                         }
@@ -514,16 +629,16 @@ pub(crate) fn sync_heaps() {
                     // No view, in a slot that shows none: nothing to make or
                     // unmake (32,000 of 41,000 a frame on the water, run
                     // b2-water).
-                    if word(0) != VIEW_TAG && host.shows_none(index) {
+                    if !is_view && host.shows_none(index) {
                         out.nothing += 1;
                         continue;
                     }
                     out.make.push(index);
                     out.kinds[if samplers {
                         3
-                    } else if word(0) != VIEW_TAG {
+                    } else if !is_view {
                         0
-                    } else if word(2) >> KIND_SHIFT == 0 {
+                    } else if w2_kind == 0 {
                         1
                     } else {
                         2
@@ -533,6 +648,14 @@ pub(crate) fn sync_heaps() {
             *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
         });
         drop(copied);
+        let (mut total_make, mut total_wait) = (0usize, 0usize);
+        for part in &mut found {
+            let part = part.get_mut().unwrap_or_else(|e| e.into_inner());
+            total_make += part.make.len();
+            total_wait += part.wait.len();
+        }
+        let mut make: Vec<u32> = Vec::with_capacity(total_make);
+        wait.reserve(total_wait);
         for part in found {
             let mut part = part.into_inner().unwrap_or_else(|e| e.into_inner());
             pages += part.pages;
@@ -551,13 +674,15 @@ pub(crate) fn sync_heaps() {
             }
         }
         spent[1] += since(began);
-        let began = std::time::Instant::now();
-        crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
-                host.mirror(index, start + u64::from(index) * step, false);
-            }
-        });
-        spent[2] += since(began);
+        if !make.is_empty() {
+            let began = std::time::Instant::now();
+            crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
+                for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+                    host.mirror(index, start + u64::from(index) * step, false);
+                }
+            });
+            spent[2] += since(began);
+        }
         if !wait.is_empty() {
             host.copied_wait(frame, std::mem::take(&mut wait));
         }
@@ -1139,16 +1264,18 @@ impl Views {
     /// The number of `shape`, a new one if it is not there yet; `None` when
     /// the shapes are full (the view is then a table entry).
     fn shape(&mut self, shape: Shape) -> Option<u32> {
-        if let Some(&at) = self.shape_index.get(&shape) {
-            return Some(at);
+        match self.shape_index.entry(shape) {
+            std::collections::btree_map::Entry::Occupied(e) => Some(*e.get()),
+            std::collections::btree_map::Entry::Vacant(e) => {
+                if self.shapes.len() >= SHAPES {
+                    return None;
+                }
+                let at = self.shapes.len() as u32;
+                self.shapes.push(shape);
+                e.insert(at);
+                Some(at)
+            }
         }
-        if self.shapes.len() >= SHAPES {
-            return None;
-        }
-        let at = self.shapes.len() as u32;
-        self.shapes.push(shape);
-        self.shape_index.insert(shape, at);
-        Some(at)
     }
 
     /// The view of placed memory [`placed_words`] named.
@@ -1172,24 +1299,26 @@ impl Views {
     /// The record words of `view` as a table entry: its entry (a new or a
     /// freed one if the view is not there yet) and that entry's generation.
     fn entry(&mut self, view: View) -> [u32; 2] {
-        let i = match self.index.get(&view) {
-            Some(&i) => i,
-            None => {
+        let i = match self.index.entry(view) {
+            std::collections::btree_map::Entry::Occupied(e) => *e.get(),
+            std::collections::btree_map::Entry::Vacant(e) => {
+                let resources = e.key().resources();
+                let view_copy = e.key().clone();
                 let i = match self.free.pop() {
                     Some(i) => {
-                        self.list[i as usize].0 = view.clone();
+                        self.list[i as usize].0 = view_copy;
                         i
                     }
                     None => {
-                        self.list.push((view.clone(), 1));
-                        self.list.len() as u32 - 1
+                        let i = self.list.len() as u32;
+                        self.list.push((view_copy, 1));
+                        i
                     }
                 };
-                for r in view.resources().into_iter().filter(|&r| r != 0) {
+                for r in resources.into_iter().filter(|&r| r != 0) {
                     self.by_resource.entry(r).or_default().push(i);
                 }
-                self.index.insert(view, i);
-                i
+                *e.insert(i)
             }
         };
         [i, self.list[i as usize].1]
@@ -1351,38 +1480,73 @@ fn wait_for(resource: usize, handle: u64) {
     }
 }
 
+/// Whether `handle` still holds a live `Shader` or `Unordered` view of
+/// `resource`, without cloning the `View`.
+#[cfg(windows)]
+fn view_is_resource(handle: u64, resource: usize) -> bool {
+    if handle == 0 {
+        return false;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != VIEW_TAG || generation >> KIND_SHIFT != 0 {
+        return false;
+    }
+    let views = views_read();
+    let Some((view, current)) = views.list.get(i as usize) else {
+        return false;
+    };
+    *current == generation
+        && matches!(view, View::Shader(r, _) | View::Unordered(r, _, _) if *r == resource)
+}
+
 /// Makes the host slots that waited for a texture's host copy, for the
 /// textures made since the last call. Called before a submission runs, by
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
-    for resource in made {
-        let handles = WAITING
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&resource);
-        for handle in handles.into_iter().flatten() {
+    if made.is_empty() {
+        return;
+    }
+    let mut ready: Vec<(usize, Vec<u64>)> = Vec::new();
+    {
+        let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        if !waiting.is_empty() {
+            for resource in made {
+                if let Some(handles) = waiting.remove(&resource) {
+                    ready.push((resource, handles));
+                }
+            }
+        }
+    }
+    if ready.is_empty() {
+        return;
+    }
+    // (The heap stays while the lock is held: `mirror`.)
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for (resource, handles) in ready {
+        for handle in handles {
             // Only if the slot still holds a view of that texture: the
             // title may have written it since (and a view of another
             // texture without a host copy must go on waiting).
             // (Looked up first: the handle is read only while its heap is
             // there.)
-            // (The heap stays while the lock is held: `mirror`.)
-            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-            let Some(&(_, _, at)) = heaps.iter().find(|&&(start, end, _)| (start..end).contains(&handle)) else {
+            let Some(&(_, _, at)) = heaps
+                .iter()
+                .find(|&&(start, end, _)| (start..end).contains(&handle))
+            else {
                 continue;
             };
             // SAFETY: a registered heap, live while the lock is held.
             let heap = unsafe { &*(at as *const Heap) };
+            let Some(Some(host)) = heap.host.get() else {
+                continue;
+            };
             let Some(index) = heap.index(handle) else {
                 continue;
             };
-            let same = match view(handle) {
-                Some(View::Shader(r, _) | View::Unordered(r, _, _)) => r == resource,
-                _ => false,
-            };
-            if same && let Some(Some(host)) = heap.host.get() {
+            if view_is_resource(handle, resource) {
                 host.mirror(index, handle, true);
             }
         }
@@ -1411,16 +1575,18 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    let views = &mut *views;
+    views.free.reserve(entries.len());
     for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
+        let (view, generation) = &mut views.list[i as usize];
         // Entries freed through a view's other resource may hold another
         // view by now.
-        if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
+        if !view.resources().contains(&resource) || views.index.get(&*view) != Some(&i) {
             continue;
         }
-        views.index.remove(&view);
+        views.index.remove(&*view);
         // (Below the bits that say a record is no table entry.)
-        views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        *generation = ((*generation + 1) & GENERATIONS).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
@@ -1557,26 +1723,25 @@ pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], 
 
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
+    if count == 0 || dst == 0 || src == 0 {
+        return;
+    }
     let Some(step) = increment(kind).map(u64::from) else {
         return;
     };
     let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
-        // SAFETY: both ranges are descriptor slots the title owns.
-        #[cfg(windows)]
-        unsafe {
-            crate::titlewrite::put(dst as *mut u8, src as *const u8, len as usize)
-        };
-        // SAFETY: as above.
-        #[cfg(not(windows))]
-        unsafe {
-            std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
-        };
-        #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
-    }
+    // SAFETY: both ranges are descriptor slots the title owns.
+    #[cfg(windows)]
+    unsafe {
+        crate::titlewrite::put(dst as *mut u8, src as *const u8, len as usize)
+    };
+    // SAFETY: as above.
+    #[cfg(not(windows))]
+    unsafe {
+        std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
+    };
+    #[cfg(windows)]
+    mirror_range(dst, count, step);
 }
 
 /// Device method: ranges of descriptors (start and count each) gathered
@@ -1592,35 +1757,35 @@ pub(crate) extern "system" fn copy(
     src_sizes: *const u32,
     kind: u32,
 ) {
+    if dst_ranges == 0 || src_ranges == 0 || dst_starts.is_null() || src_starts.is_null() {
+        return;
+    }
     let Some(step) = increment(kind) else {
         return;
     };
     // Each range as (start, count); a null size array means one descriptor
     // per range.
-    let ranges = |n: u32, starts: *const u64, sizes: *const u32| -> Vec<(u64, u32)> {
-        (0..n as usize)
-            .map(|i| {
-                // SAFETY: the title passes `n` starts and sizes (or null sizes).
-                unsafe {
-                    (
-                        *starts.add(i),
-                        if sizes.is_null() { 1 } else { *sizes.add(i) },
-                    )
-                }
-            })
-            .collect()
+    let range_at = |i: usize, starts: *const u64, sizes: *const u32| -> (u64, u32) {
+        // SAFETY: the title passes `n` starts and sizes (or null sizes).
+        unsafe {
+            (
+                *starts.add(i),
+                if sizes.is_null() { 1 } else { *sizes.add(i) },
+            )
+        }
     };
-    if dst_starts.is_null() || src_starts.is_null() {
-        return;
-    }
-    let src = ranges(src_ranges, src_starts, src_sizes);
-    let mut dst = ranges(dst_ranges, dst_starts, dst_sizes).into_iter();
-    let (mut to, mut room) = dst.next().unwrap_or((0, 0));
-    for (mut from, mut left) in src {
+    let mut dst_i = 0usize;
+    let dst_n = dst_ranges as usize;
+    let (mut to, mut room) = (0u64, 0u32);
+    for src_i in 0..src_ranges as usize {
+        let (mut from, mut left) = range_at(src_i, src_starts, src_sizes);
         while left > 0 {
             while room == 0 {
-                let Some(next) = dst.next() else { return };
-                (to, room) = next;
+                if dst_i >= dst_n {
+                    return;
+                }
+                (to, room) = range_at(dst_i, dst_starts, dst_sizes);
+                dst_i += 1;
             }
             let n = left.min(room);
             copy_simple(std::ptr::null(), n, to, from, kind);

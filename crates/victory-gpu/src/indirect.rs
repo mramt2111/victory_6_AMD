@@ -400,6 +400,7 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
 }
 
 /// Minimum record byte stride for a supported PC indirect argument `kind`.
+#[inline]
 fn min_stride(kind: u32) -> Option<u32> {
     match kind {
         0 => Some(16),
@@ -410,6 +411,7 @@ fn min_stride(kind: u32) -> Option<u32> {
 }
 
 /// Validates record alignment and returns the scratch byte size `stride * records`.
+#[inline]
 fn validate_layout(
     (kind, stride, records): (u32, u32, u32),
     src_offset: u64,
@@ -441,11 +443,11 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
     spread: bool,
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let src_bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     // Spread dispatch records are 20 bytes each ([row, asked x, x, y, z]).
-    let bytes = if spread { bytes.max(20 * u64::from(spec.2)) } else { bytes };
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false, spread).then_some(dst)
+    let scratch_bytes = if spread { src_bytes.max(20 * u64::from(spec.2)) } else { src_bytes };
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(scratch_bytes)?);
+    clamp_into(list, c, &dst, budget, src, count, spec, src_bytes, false, spread).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -463,9 +465,9 @@ pub(crate) fn bound_ahead(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true, false).then_some(dst)
+    let src_bytes = validate_layout(spec, src.1, None)?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(src_bytes)?);
+    clamp_into(list, c, &dst, budget, src, None, spec, src_bytes, true, false).then_some(dst)
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -480,12 +482,13 @@ fn clamp_into(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
+    src_bytes: u64,
     ahead: bool,
     spread: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_with(c, &list.list, (dst, before), budget, src, count, spec, ahead, spread);
-    if recorded {
+    let recorded = record_clamp_validated(c, &list.list, (dst, before), budget, src, count, spec, src_bytes, ahead, spread);
+    if recorded && before != D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT {
         list.indirect_readable(dst);
     }
     recorded
@@ -514,8 +517,29 @@ fn record_clamp_as(
 /// [`record_clamp_as`]; `spread`: dispatch records past 65,535 groups in x
 /// are spread across z, every record written as [row, asked x, x, y, z]
 /// (20 bytes) for `crate::draw`'s spread command signature.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_with(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    dst: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+    spread: bool,
+) -> bool {
+    let Some(bytes) = validate_layout(spec, src.1, count.map(|(_, off)| off)) else {
+        return false;
+    };
+    record_clamp_validated(c, l, dst, budget, src, count, spec, bytes, ahead, spread)
+}
+
+/// Records the clamp after [`validate_layout`] has already succeeded with
+/// source byte span `bytes`.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_validated(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
@@ -523,16 +547,10 @@ fn record_clamp_with(
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
+    bytes: u64,
     ahead: bool,
     spread: bool,
 ) -> bool {
-    let Some(bytes) = validate_layout(
-        (kind, stride, records),
-        src_offset,
-        count.map(|(_, off)| off),
-    ) else {
-        return false;
-    };
     // SAFETY: live D3D12 buffer resources.
     let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
@@ -651,24 +669,35 @@ pub(crate) fn open_batch(
     recent: &[(u64, ID3D12Resource)],
 ) -> Option<(batch::Table, ID3D12Resource)> {
     let c = batch_clamp()?;
-    let budget = list.budget()?;
-    let (jobs, at) = list.scratch(batch::TABLE)?;
-    let (dst, base, before) = list.batch_place()?;
     let gpu = |b: &ID3D12Resource| {
         // SAFETY: a live buffer.
         Some(unsafe { b.GetGPUVirtualAddress() }).filter(|at| at.is_multiple_of(4))
     };
+    let first_gpu = gpu(source.1)?;
+    let budget = list.budget()?;
+    let (jobs, at) = list.scratch(batch::TABLE)?;
+    let (dst, base, before) = list.batch_place()?;
     // A source there is none of is the first again, which no job names.
     let mut ids = [0u64; batch::SOURCES];
-    let mut sources = [gpu(source.1)?; batch::SOURCES];
+    let mut sources = [first_gpu; batch::SOURCES];
     ids[0] = source.0;
-    let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
-    for (i, (id, buffer)) in others.enumerate() {
-        if let Some(at) = gpu(buffer) {
-            // Bound, and read only if a job names it: kept alive like the
-            // copies draws read (`Shadow::refresh`).
-            list.keep(buffer);
-            (ids[i + 1], sources[i + 1]) = (*id, at);
+    if !recent.is_empty() {
+        let mut slot = 1;
+        for (id, buffer) in recent {
+            if *id == source.0 {
+                continue;
+            }
+            if let Some(at) = gpu(buffer) {
+                // Bound, and read only if a job names it: kept alive like the
+                // copies draws read (`Shadow::refresh`).
+                list.keep(buffer);
+                ids[slot] = *id;
+                sources[slot] = at;
+            }
+            slot += 1;
+            if slot == batch::SOURCES {
+                break;
+            }
         }
     }
     #[cfg(feature = "diagnostics")]
@@ -686,6 +715,7 @@ pub(crate) fn batch_for(device: &ID3D12Device) -> windows::core::Result<(ID3D12R
     make_from(device, batch::SOURCE).map(|c| (c.root, c.pso))
 }
 
+#[inline]
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,

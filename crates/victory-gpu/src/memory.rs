@@ -66,6 +66,7 @@
 //! shortcut: pages a list does not name are looked at again in turn, over
 //! [`SWEEP`] frames.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -236,21 +237,21 @@ impl Memory {
         Some(Memory {
             directory: (entries as *mut u32, directory),
             faults: (faults, data.cast::<u32>(), gpu),
-            copies: Vec::new(),
-            numbers: HashMap::new(),
-            arenas: Vec::new(),
-            pages: HashMap::new(),
-            order: Vec::new(),
+            copies: Vec::with_capacity(64),
+            numbers: HashMap::with_capacity(64),
+            arenas: Vec::with_capacity(16),
+            pages: HashMap::with_capacity(1024),
+            order: Vec::with_capacity(1024),
             sweep: 0,
             windows: 0,
-            packed: HashMap::new(),
-            packed_order: Vec::new(),
+            packed: HashMap::with_capacity(256),
+            packed_order: Vec::with_capacity(256),
             packed_sweep: 0,
-            free: Vec::new(),
-            open: Default::default(),
+            free: Vec::with_capacity(SPARE),
+            open: std::collections::HashSet::with_capacity(32),
             faulted: 0,
             frame: u64::MAX,
-            refused: Default::default(),
+            refused: std::collections::HashSet::with_capacity(64),
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -298,24 +299,26 @@ impl Memory {
     /// for previously recorded command lists.
     fn number(&mut self, shadow: Arc<Shadow>) -> Option<usize> {
         let key = shadow.id();
-        if let Some(&n) = self.numbers.get(&key) {
-            return Some(n);
+        match self.numbers.entry(key) {
+            Entry::Occupied(e) => Some(*e.get()),
+            Entry::Vacant(e) => {
+                // Directory stores a one-based index in the low 31 bits (bit 31 is
+                // MEMORY_READ_ONLY, 0 is the null view).
+                let next = u32::try_from(self.copies.len()).ok()?.checked_add(1)?;
+                if next & MEMORY_READ_ONLY != 0 {
+                    return None;
+                }
+                // SAFETY: a live buffer.
+                let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+                if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+                    return None;
+                }
+                self.copies.push(shadow);
+                let n = self.copies.len() - 1;
+                e.insert(n);
+                Some(n)
+            }
         }
-        // Directory stores a one-based index in the low 31 bits (bit 31 is
-        // MEMORY_READ_ONLY, 0 is the null view).
-        let next = u32::try_from(self.copies.len()).ok()?.checked_add(1)?;
-        if next & MEMORY_READ_ONLY != 0 {
-            return None;
-        }
-        // SAFETY: a live buffer.
-        let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-        if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-            return None;
-        }
-        self.copies.push(shadow);
-        let n = self.copies.len() - 1;
-        self.numbers.insert(key, n);
-        Some(n)
     }
 
     /// Gives `page` a place, if it has none and the memory is the title's;
@@ -332,15 +335,16 @@ impl Memory {
             let Some(shadow) = crate::shadow::find(start, PAGE) else {
                 return false;
             };
-            let fresh = !self.numbers.contains_key(&shadow.id());
-            let Some(n) = self.number(shadow.clone()) else {
+            let (first, len) = shadow.span();
+            let prev_len = self.copies.len();
+            let Some(n) = self.number(shadow) else {
                 return false;
             };
+            let fresh = self.copies.len() > prev_len;
             // Every page the copy holds whole, not only the one asked for.
             // shortcut: a page of a title buffer inside this one that has a
             // copy of its own is given this copy too.
             if fresh {
-                let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
                     let entry = self.entry(at / PAGE);
@@ -353,7 +357,7 @@ impl Memory {
             }
             // SAFETY: as above.
             if unsafe { self.entry(page).read() } == 0 {
-                close(self.entry(page), n, start - shadow.span().0);
+                close(self.entry(page), n, start - first);
             }
             return true;
         }
@@ -414,13 +418,16 @@ impl Memory {
     fn gone(&mut self, address: u64) {
         let Some(packed) = self.packed.remove(&address) else { return };
         for page in address / PAGE..=(address + packed.len - 1) / PAGE {
-            let Some(held) = self.pages.get_mut(&page) else { continue };
-            held.owners = held.owners.saturating_sub(1);
-            if held.owners == 0 && held.theirs {
-                self.free.push((held.copy, held.at));
-                self.pages.remove(&page);
-                // SAFETY: an entry of the directory, under the mutex.
-                unsafe { self.entry(page).write_volatile(0) };
+            if let Entry::Occupied(mut e) = self.pages.entry(page) {
+                let held = e.get_mut();
+                held.owners = held.owners.saturating_sub(1);
+                if held.owners == 0 && held.theirs {
+                    let (copy, at) = (held.copy, held.at);
+                    e.remove();
+                    self.free.push((copy, at));
+                    // SAFETY: an entry of the directory, under the mutex.
+                    unsafe { self.entry(page).write_volatile(0) };
+                }
             }
         }
         self.stats.gone += 1;
@@ -466,10 +473,11 @@ impl Memory {
     /// A dispatch of the builder was given `address` to write: if it is in a
     /// title buffer's copy, stores by address reach that from here on.
     fn opens(&mut self, address: u64) {
-        let Some(n) = self.map(address / PAGE).then(|| self.copy_of(address / PAGE)).flatten() else {
+        let page = address / PAGE;
+        let Some(n) = self.map(page).then(|| self.copy_of(page)).flatten() else {
             return;
         };
-        if self.pages.contains_key(&(address / PAGE)) || !self.open.insert(n) {
+        if self.pages.contains_key(&page) || !self.open.insert(n) {
             return;
         }
         // (Its pages hold what the CPU writes beside the builder's scratch.)
@@ -502,6 +510,9 @@ impl Memory {
     /// Takes the pages `[first, end)` that are in arenas from title memory
     /// where it wrote them.
     fn bring(&mut self, first: u64, end: u64) {
+        if first >= end {
+            return;
+        }
         // Once a frame: the builder names the same pages list after list.
         let frame = self.frame;
         if !(first..end).any(|page| self.pages.get(&page).is_some_and(|h| h.looked != frame)) {
@@ -509,6 +520,8 @@ impl Memory {
         }
         let started = std::time::Instant::now();
         let answer = crate::watch::writes((first * PAGE) as usize, (end * PAGE) as usize, true);
+        let now = answer.as_ref().map_or(1, |a| a.0);
+        let writes = answer.as_ref().map(|(_, w)| w.as_slice());
         for page in first..end {
             let Some(held) = self.pages.get_mut(&page) else {
                 continue;
@@ -518,10 +531,7 @@ impl Memory {
             }
             held.looked = frame;
             self.stats.looked += 1;
-            let wrote = answer
-                .as_ref()
-                .map(|(_, w)| w.binary_search_by_key(&(page as usize), |w| w.0).map_or(0, |i| w[i].1));
-            let now = answer.as_ref().map_or(1, |a| a.0);
+            let wrote = writes.map(|w| w.binary_search_by_key(&(page as usize), |w| w.0).map_or(0, |i| w[i].1));
             let stale = held.taken == 0 || wrote.is_none_or(|w| w > held.taken);
             if !stale {
                 continue;
@@ -576,18 +586,21 @@ impl Memory {
             }
             return;
         };
+        let mut insert_packed = true;
         if let Some(known) = self.packed.get_mut(&address) {
             let soon = known.frame + AGAIN >= self.frame;
             known.frame = self.frame;
-            if known.header == header && soon {
-                return;
-            }
-            if known.header != header {
+            if known.header == header {
+                if soon {
+                    return;
+                }
+                insert_packed = false;
+            } else {
                 self.gone(address);
             }
         }
         let last = (address + len - 1) / PAGE;
-        if !self.packed.contains_key(&address) {
+        if insert_packed {
             self.packed.insert(address, Packed { frame: self.frame, len, header });
             self.packed_order.push(address);
             for page in page..=last {
@@ -710,6 +723,9 @@ impl Memory {
         let Some((from, len)) = crate::upload::block(address as usize) else {
             return;
         };
+        if len == 0 {
+            return;
+        }
         let mut seen = std::collections::HashSet::new();
         let mut chunk = [0u64; 512];
         let chunk_bytes = size_of_val(&chunk);
@@ -722,9 +738,11 @@ impl Memory {
                 break;
             }
             for &word in &chunk[..bytes / 8] {
-                if word & 0xFF == 0 && (1 << 32..1 << 37).contains(&word) && seen.insert(word / PAGE) && self.map(word / PAGE) {
+                if word & 0xFF == 0 && (1 << 32..1 << 37).contains(&word) {
                     let page = word / PAGE;
-                    self.bring(page, page + 1);
+                    if seen.insert(page) && self.map(page) {
+                        self.bring(page, page + 1);
+                    }
                 }
             }
             offset += bytes;
@@ -946,31 +964,36 @@ pub(crate) fn ready(
     // looks like one names memory nothing reads; one that is not the title's
     // memory is refused.
     let held = |m: &Memory| m.pages.len() as u64;
-    let before = held(m);
-    for (i, &c) in constants.iter().enumerate() {
-        if let Some(&high) = constants.get(i + 1)
-            && (1..=0x1F).contains(&high)
-            && c >= 0x1_0000
-        {
-            let at = u64::from(c) | u64::from(high) << 32;
-            if named(1, at) {
-                m.ready(at, 1);
+    let mut came = [0u64; 4];
+    if !constants.is_empty() {
+        let before = held(m);
+        for (i, &c) in constants.iter().enumerate() {
+            if let Some(&high) = constants.get(i + 1)
+                && (1..=0x1F).contains(&high)
+                && c >= 0x1_0000
+            {
+                let at = u64::from(c) | u64::from(high) << 32;
+                if named(1, at) {
+                    m.ready(at, 1);
+                }
+            }
+            if builds && (0x0100_0000..0x2000_0000).contains(&c) {
+                let at = u64::from(c) << 8;
+                if named(1, at) {
+                    m.ready(at, 1);
+                }
             }
         }
-        if builds && (0x0100_0000..0x2000_0000).contains(&c) {
-            let at = u64::from(c) << 8;
-            if named(1, at) {
-                m.ready(at, 1);
-            }
-        }
+        came[0] = held(m) - before;
     }
-    let mut came = [held(m) - before, 0, 0, 0];
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
+        let mut in_buf_cache: Option<Option<(u64, u64)>> = None;
+        let mut in_buf = || *in_buf_cache.get_or_insert_with(|| crate::shadow::in_buffer(at, 1));
         // (Several structures to a page.)
         let mut packed = false;
         if builds
             && list.first_use(usize::MAX - (3 << 33) - (at >> 8) as usize)
-            && crate::shadow::in_buffer(at, 1).is_none()
+            && in_buf().is_none()
             && m.possible(at / PAGE)
         {
             // What it needs, as far as it is known now; the rest when the
@@ -996,7 +1019,7 @@ pub(crate) fn ready(
             m.bring_up(list, m.copies.len());
         }
         if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
-            if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
+            if let Some((start, len)) = in_buf()
                 && len <= BACK
                 && use_ == (Use::Builds { back: true })
                 && list.first_use(usize::MAX - (5 << 33) - (start >> 2 & 0x7FFF_FFFF) as usize)
@@ -1004,7 +1027,7 @@ pub(crate) fn ready(
                 m.small(list, start, len);
             }
             m.opens(at);
-            if !packed && crate::shadow::in_buffer(at, 1).is_none() {
+            if !packed && in_buf().is_none() {
                 #[cfg(feature = "diagnostics")]
                 {
                     let built = m.dump.built.entry(at).or_insert((frame, frame, 0));
@@ -1019,7 +1042,7 @@ pub(crate) fn ready(
             continue;
         }
         let before = held(m);
-        match crate::shadow::in_buffer(at, 1) {
+        match in_buf() {
             Some(_) => {
                 m.ready(at, 1);
                 m.named_in_upload(at);

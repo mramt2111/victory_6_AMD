@@ -149,13 +149,13 @@ fn fast_of(sets: &[(u32, u8, u8)]) -> Vec<u32> {
 }
 
 /// The sets of one fast core of the last, and all the others, for
-/// [`lane_core`]; `None` with fewer than six fast cores.
+/// [`lane_core`]; `None` with fewer than eight fast cores.
 fn one_core(sets: &[(u32, u8, u8)]) -> Option<(Vec<u32>, Vec<u32>)> {
     let best = sets.iter().map(|c| c.1).max()?;
     let mut cores: Vec<u8> = sets.iter().filter(|c| c.1 == best).map(|c| c.2).collect();
     cores.sort_unstable();
     cores.dedup();
-    let core = *cores.last().filter(|_| cores.len() >= 6)?;
+    let core = *cores.last().filter(|_| cores.len() >= 8)?;
     let of = |own: bool| sets.iter().filter(|c| (c.2 == core) == own).map(|c| c.0).collect();
     Some((of(true), of(false)))
 }
@@ -223,7 +223,15 @@ pub(crate) fn settle() {
 /// slow ones stood idle.
 fn stage() -> u32 {
     static STAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *STAGE.get_or_init(|| std::env::var("VICTORY_FAST_CORES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
+    *STAGE.get_or_init(|| {
+        std::env::var("VICTORY_FAST_CORES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| {
+                let sets = cpu_sets();
+                if fast_sets(&sets, false).len() <= 8 { 1 } else { 2 }
+            })
+    })
 }
 
 /// Asks the system to run the calling thread, which a frame waits for, on

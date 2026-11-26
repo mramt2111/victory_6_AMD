@@ -25,6 +25,11 @@ use crate::object::This;
 
 /// Size of each 256B-aligned AS backing slab (64 MiB).
 const AS_SLAB_SIZE: u64 = 64 << 20;
+const AS_SLAB_SIZE_LOW: u64 = 32 << 20;
+
+fn as_slab_size() -> u64 {
+    if crate::residency::low_end_vram() { AS_SLAB_SIZE_LOW } else { AS_SLAB_SIZE }
+}
 /// Required DXR alignment for acceleration structures and scratch buffers.
 const AS_ALIGN: u64 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT as u64;
 /// Default initial reservation for a pre-bound TLAS slot so `HostHeap` SRVs
@@ -104,6 +109,48 @@ pub fn suppress_builder() -> bool {
             && std::env::var_os("VICTORY_NATIVE_RT_SUPPRESS_BUILDER")
                 .is_some_and(|v| v == "1")
     })
+}
+
+/// Unified capability summary for host DXR Tier 1.1 native raytracing and the
+/// software `XboxBvhBuilder.dll` fallback path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RayTracingCapabilities {
+    pub native_rt_requested: bool,
+    pub native_rt_supported: bool,
+    pub native_rt_enabled: bool,
+    pub software_bvh_enabled: bool,
+}
+
+/// Resolves effective native DXR and software BVH builder capabilities from
+/// environment requests and host hardware support.
+pub fn resolve_capabilities(
+    native_rt_requested: bool,
+    native_rt_supported: bool,
+    bvh_builder_requested: bool,
+    suppress_builder: bool,
+) -> RayTracingCapabilities {
+    let native_rt_enabled = native_rt_requested && native_rt_supported;
+    let software_bvh_enabled = bvh_builder_requested && !(native_rt_enabled && suppress_builder);
+    RayTracingCapabilities {
+        native_rt_requested,
+        native_rt_supported,
+        native_rt_enabled,
+        software_bvh_enabled,
+    }
+}
+
+/// Returns the resolved raytracing capabilities for the current process and host GPU.
+pub fn capabilities() -> RayTracingCapabilities {
+    let native_rt_requested = requested();
+    let native_rt_supported = host().is_some_and(Host::raytracing_tier_1_1);
+    let bvh_builder_requested = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+    let suppress = std::env::var_os("VICTORY_NATIVE_RT_SUPPRESS_BUILDER").is_some_and(|v| v == "1");
+    resolve_capabilities(
+        native_rt_requested,
+        native_rt_supported,
+        bvh_builder_requested,
+        suppress,
+    )
 }
 
 /// Whether opaque static BLAS geometries should also set
@@ -465,7 +512,7 @@ impl<B: Clone> SlabAllocator<B> {
         }
 
         // Allocate a fresh backing slab.
-        let slab_size = need.max(AS_SLAB_SIZE).next_multiple_of(AS_ALIGN);
+        let slab_size = need.max(as_slab_size()).next_multiple_of(AS_ALIGN);
         let slab_idx = self.slabs.len();
         let (buffer, gpu_base) = make_slab(slab_size, slab_idx)?;
         self.slabs.push(Slab {
@@ -607,21 +654,49 @@ impl<B: Clone> SlabAllocator<B> {
 
 static DXR_SLAB_BYTES: AtomicU64 = AtomicU64::new(0);
 
+fn dxr_cached_vram_budget() -> Option<u64> {
+    static BUDGET: AtomicU64 = AtomicU64::new(0);
+    let cached = BUDGET.load(Ordering::Relaxed);
+    if cached != 0 {
+        return Some(cached);
+    }
+    let budget = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .map(|[b, ..]| b)
+        .filter(|&b| b > 0)?;
+    BUDGET.store(budget, Ordering::Relaxed);
+    Some(budget)
+}
+
 /// Local VRAM reserved by the texture queue for Native DXR AS slabs not yet
-/// allocated (`VICTORY_CARD_ROOM_FOR_DXR_MB`, default 1,536 MiB when
-/// `VICTORY_NATIVE_RT=1`, 0 otherwise), releasing automatically as slabs grow.
+/// allocated (`VICTORY_CARD_ROOM_FOR_DXR_MB`, scaling from 512 / 1,024 / 1,536 MiB
+/// by VRAM budget when `VICTORY_NATIVE_RT=1`, 0 otherwise), releasing automatically as slabs grow.
 pub(crate) fn dxr_room_kept() -> u64 {
     if !enabled() {
         return 0;
     }
-    static MOST: OnceLock<u64> = OnceLock::new();
-    let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_ROOM_FOR_DXR_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(1536)
-            << 20
-    });
+    static OVERRIDE: OnceLock<Option<u64>> = OnceLock::new();
+    let most = (*OVERRIDE.get_or_init(|| {
+            std::env::var("VICTORY_CARD_ROOM_FOR_DXR_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(|mb| mb << 20)
+        }))
+        .unwrap_or_else(|| {
+            const EIGHT_GIB: u64 = 8 << 30;
+            const TWELVE_GIB: u64 = 12 << 30;
+            if crate::residency::low_end_override() == Some(true) {
+                512 << 20
+            } else if crate::residency::low_end_override() == Some(false) {
+                1536 << 20
+            } else {
+                match dxr_cached_vram_budget() {
+                    Some(b) if b <= EIGHT_GIB => 512 << 20,
+                    Some(b) if b <= TWELVE_GIB => 1024 << 20,
+                    _ => 1536 << 20,
+                }
+            }
+        });
     most.saturating_sub(DXR_SLAB_BYTES.load(Ordering::Relaxed))
 }
 
@@ -2544,19 +2619,23 @@ fn record_static_upgrades(
             list.Reset(&allocator, None)?;
             list.ResourceBarrier(&[uav_barrier(None)]);
             list.CopyBufferRegion(&verts_buf, 0, &upload_buf, 0, batch_bytes);
-            list.ResourceBarrier(&[transition(
+            let mut pre_build_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(2);
+            pre_build_barriers.push(transition(
                 &verts_buf,
                 D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            )]);
+            ));
             if let Some((uav_buf, _, _)) = &compact_info {
-                list.ResourceBarrier(&[transition(
+                pre_build_barriers.push(transition(
                     uav_buf,
                     D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )]);
+                ));
             }
-            for &(idx, guest_key, gpu_va, generation, slice_size) in &built_items {
+            list.ResourceBarrier(&pre_build_barriers);
+            for (item_i, &(idx, guest_key, gpu_va, generation, slice_size)) in
+                built_items.iter().enumerate()
+            {
                 let item = &prepared[idx];
                 let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
                     Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
@@ -2594,36 +2673,53 @@ fn record_static_upgrades(
                     &desc,
                     postbuild.as_ref().map(|p| p.as_slice()),
                 );
-                list.ResourceBarrier(&[uav_barrier(None)]);
-            }
-            if let Some((uav_buf, _, rb_buf)) = &compact_info {
-                if !new_queries.is_empty() {
-                    list.ResourceBarrier(&[transition(
-                        uav_buf,
-                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    )]);
-                    let off = (first_slot as u64) * 8;
-                    let len = (new_queries.len() as u64) * 8;
-                    list.CopyBufferRegion(rb_buf, off, uav_buf, off, len);
-                    list.ResourceBarrier(&[transition(
-                        uav_buf,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        D3D12_RESOURCE_STATE_COMMON,
-                    )]);
-                } else {
-                    list.ResourceBarrier(&[transition(
-                        uav_buf,
-                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        D3D12_RESOURCE_STATE_COMMON,
-                    )]);
+                if item_i + 1 < built_items.len() {
+                    list.ResourceBarrier(&[uav_barrier(None)]);
                 }
             }
-            list.ResourceBarrier(&[transition(
-                &verts_buf,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                D3D12_RESOURCE_STATE_COMMON,
-            )]);
+            if let Some((uav_buf, _, rb_buf)) = &compact_info
+                && !new_queries.is_empty()
+            {
+                list.ResourceBarrier(&[
+                    uav_barrier(None),
+                    transition(
+                        uav_buf,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    ),
+                ]);
+                let off = (first_slot as u64) * 8;
+                let len = (new_queries.len() as u64) * 8;
+                list.CopyBufferRegion(rb_buf, off, uav_buf, off, len);
+                list.ResourceBarrier(&[
+                    transition(
+                        uav_buf,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    ),
+                    transition(
+                        &verts_buf,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    ),
+                ]);
+            } else {
+                let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(3);
+                post_barriers.push(uav_barrier(None));
+                if let Some((uav_buf, _, _)) = &compact_info {
+                    post_barriers.push(transition(
+                        uav_buf,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    ));
+                }
+                post_barriers.push(transition(
+                    &verts_buf,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ));
+                list.ResourceBarrier(&post_barriers);
+            }
             list.Close()
         })()
     };
@@ -2907,14 +3003,15 @@ fn record_ops(
     let compact_start_slot = sub.compact_queries.len();
     let mut compact_uav_active: Option<(ID3D12Resource, ID3D12Resource)> = None;
     let mut recorded_any = false;
+    // Defer global UAV barriers so they coalesce with adjacent transition barriers
+    // on the next op or end-of-list readback copy.
+    let mut pending_uav = true;
 
     // SAFETY: allocator/list are idle; all buffers referenced are kept in `sub` or slabs.
     let res: windows::core::Result<()> = unsafe {
         (|| {
             allocator.Reset()?;
             list.Reset(&allocator, None)?;
-            // Ensure prior GPU compute/copy work (e.g. skinning or BVH4 rehydration) is visible.
-            list.ResourceBarrier(&[uav_barrier(None)]);
 
             for op in ops {
                 match op {
@@ -2926,7 +3023,18 @@ fn record_ops(
                         postbuild,
                     } => {
                         if record_build_blas(
-                            host, device5, state, sub, &list, &list4, *dest_va, *source_va, *flags, geometries, postbuild,
+                            host,
+                            device5,
+                            state,
+                            sub,
+                            &list,
+                            &list4,
+                            *dest_va,
+                            *source_va,
+                            *flags,
+                            geometries,
+                            postbuild,
+                            &mut pending_uav,
                         ) {
                             recorded_any = true;
                         }
@@ -2936,7 +3044,16 @@ fn record_ops(
                         source_va,
                         mode,
                     } => {
-                        if record_copy_as(host, state, &list, &list4, *dest_va, *source_va, *mode) {
+                        if record_copy_as(
+                            host,
+                            state,
+                            &list,
+                            &list4,
+                            *dest_va,
+                            *source_va,
+                            *mode,
+                            &mut pending_uav,
+                        ) {
                             recorded_any = true;
                         }
                     }
@@ -2956,6 +3073,7 @@ fn record_ops(
                             *size_bytes,
                             &mut extract_in_srv,
                             &mut compact_uav_active,
+                            &mut pending_uav,
                         ) {
                             recorded_any = true;
                         }
@@ -2984,6 +3102,7 @@ fn record_ops(
                             &mut hash_in_srv,
                             &mut host_inst_in_srv,
                             built_tlas,
+                            &mut pending_uav,
                         ) {
                             recorded_any = true;
                         }
@@ -2992,12 +3111,17 @@ fn record_ops(
             }
             if let Some((uav_buf, rb_buf)) = compact_uav_active.take() {
                 let count = sub.compact_queries.len().saturating_sub(compact_start_slot);
+                let mut end_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(2);
+                if pending_uav {
+                    end_barriers.push(uav_barrier(None));
+                }
                 if count > 0 {
-                    list.ResourceBarrier(&[transition(
+                    end_barriers.push(transition(
                         &uav_buf,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    )]);
+                    ));
+                    list.ResourceBarrier(&end_barriers);
                     let off = (compact_start_slot as u64) * 8;
                     let len = (count as u64) * 8;
                     list.CopyBufferRegion(&rb_buf, off, &uav_buf, off, len);
@@ -3007,12 +3131,15 @@ fn record_ops(
                         D3D12_RESOURCE_STATE_COMMON,
                     )]);
                 } else {
-                    list.ResourceBarrier(&[transition(
+                    end_barriers.push(transition(
                         &uav_buf,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_COMMON,
-                    )]);
+                    ));
+                    list.ResourceBarrier(&end_barriers);
                 }
+            } else if pending_uav && recorded_any {
+                list.ResourceBarrier(&[uav_barrier(None)]);
             }
             list.Close()
         })()
@@ -3047,6 +3174,7 @@ unsafe fn record_build_blas(
     raw_flags: u32,
     geometries: &[GeometrySpec],
     postbuild: &[PostbuildSpec],
+    pending_uav: &mut bool,
 ) -> bool {
     let key = dest_va & !0xFF;
     if key == 0 || geometries.is_empty() {
@@ -3323,17 +3451,22 @@ unsafe fn record_build_blas(
     };
     // SAFETY: open list4; dest, src, scratch, geometry buffers and postbuild buffers live.
     unsafe {
+        if *pending_uav {
+            list.ResourceBarrier(&[uav_barrier(None)]);
+            *pending_uav = false;
+        }
         list4.BuildRaytracingAccelerationStructure(
             &desc,
             (!host_postbuild.is_empty()).then_some(host_postbuild.as_slice()),
         );
-        list.ResourceBarrier(&[uav_barrier(None)]);
     }
+    *pending_uav = true;
     state.insert_blas_hash(key, host_dst_va);
     STATS[STAT_DYNAMIC_BLAS].fetch_add(1, Ordering::Relaxed);
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn record_copy_as(
     host: &Host,
     state: &mut DxrState,
@@ -3342,6 +3475,7 @@ unsafe fn record_copy_as(
     dest_va: u64,
     source_va: u64,
     mode: u32,
+    pending_uav: &mut bool,
 ) -> bool {
     let dst_key = dest_va & !0xFF;
     let src_key = source_va & !0xFF;
@@ -3394,9 +3528,13 @@ unsafe fn record_copy_as(
     };
     // SAFETY: open list4; both AS buffers are in RAYTRACING_ACCELERATION_STRUCTURE state.
     unsafe {
+        if *pending_uav {
+            list.ResourceBarrier(&[uav_barrier(None)]);
+            *pending_uav = false;
+        }
         list4.CopyRaytracingAccelerationStructure(dst.gpu_va, src.gpu_va, host_mode);
-        list.ResourceBarrier(&[uav_barrier(None)]);
     }
+    *pending_uav = true;
     if src.kind == AsKind::Blas {
         state.insert_blas_hash(dst_key, dst.gpu_va);
     }
@@ -3417,6 +3555,7 @@ unsafe fn record_extract_static_blas(
     size_bytes: u64,
     extract_in_srv: &mut bool,
     compact_uav_active: &mut Option<(ID3D12Resource, ID3D12Resource)>,
+    pending_uav: &mut bool,
 ) -> bool {
     let key = dest_va & !0xFF;
     if key == 0 {
@@ -3527,20 +3666,28 @@ unsafe fn record_extract_static_blas(
 
     // SAFETY: open list4; view_heap, directory, vert_buf, staging/readback, AS slab, and scratch are live.
     unsafe {
+        let mut pre_dispatch_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(3);
+        if *pending_uav {
+            pre_dispatch_barriers.push(uav_barrier(None));
+            *pending_uav = false;
+        }
         if *extract_in_srv {
-            list.ResourceBarrier(&[transition(
+            pre_dispatch_barriers.push(transition(
                 &vert_buf,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            )]);
+            ));
             *extract_in_srv = false;
         }
         if let Some((staging_buf, _, _, _, _)) = &dump_copy {
-            list.ResourceBarrier(&[transition(
+            pre_dispatch_barriers.push(transition(
                 staging_buf,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            )]);
+            ));
+        }
+        if !pre_dispatch_barriers.is_empty() {
+            list.ResourceBarrier(&pre_dispatch_barriers);
         }
         list.SetDescriptorHeaps(&[Some(view_heap)]);
         list.SetComputeRootSignature(&pass.root);
@@ -3565,25 +3712,25 @@ unsafe fn record_extract_static_blas(
         let groups = (max_nodes as u32).div_ceil(64);
         list.Dispatch(groups, 1, 1);
 
-        if let Some((staging_buf, _, rb_buf, rb_off, dump_len)) = dump_copy {
+        let mut post_dispatch_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(3);
+        if let Some((staging_buf, _, rb_buf, rb_off, dump_len)) = &dump_copy {
             list.ResourceBarrier(&[transition(
-                &staging_buf,
+                staging_buf,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            list.CopyBufferRegion(&rb_buf, rb_off, &staging_buf, 0, dump_len);
-            list.ResourceBarrier(&[transition(
-                &staging_buf,
+            list.CopyBufferRegion(rb_buf, *rb_off, staging_buf, 0, *dump_len);
+            post_dispatch_barriers.push(transition(
+                staging_buf,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_COMMON,
-            )]);
+            ));
         }
-
-        list.ResourceBarrier(&[transition(
+        post_dispatch_barriers.push(transition(
             &vert_buf,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-        )]);
+        ));
         *extract_in_srv = true;
 
         let compact_postbuild = if compact_static_blas()
@@ -3591,11 +3738,11 @@ unsafe fn record_extract_static_blas(
             && let Some((uav_buf, uav_gpu, rb_buf)) = sub.ensure_compact_info(host)
         {
             if compact_uav_active.is_none() {
-                list.ResourceBarrier(&[transition(
+                post_dispatch_barriers.push(transition(
                     &uav_buf,
                     D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )]);
+                ));
                 *compact_uav_active = Some((uav_buf, rb_buf));
             }
             let slot = sub.compact_queries.len() as u32;
@@ -3612,6 +3759,7 @@ unsafe fn record_extract_static_blas(
         } else {
             None
         };
+        list.ResourceBarrier(&post_dispatch_barriers);
 
         let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
             DestAccelerationStructureData: host_dst.gpu_va,
@@ -3623,8 +3771,8 @@ unsafe fn record_extract_static_blas(
             &desc,
             compact_postbuild.as_ref().map(|p| p.as_slice()),
         );
-        list.ResourceBarrier(&[uav_barrier(None)]);
     }
+    *pending_uav = true;
     state.insert_blas_hash(key, host_dst.gpu_va);
     STATS[STAT_STATIC_BLAS].fetch_add(1, Ordering::Relaxed);
     true
@@ -3647,6 +3795,7 @@ unsafe fn record_build_tlas(
     hash_in_srv: &mut bool,
     host_inst_in_srv: &mut bool,
     built_tlas: &mut bool,
+    pending_uav: &mut bool,
 ) -> bool {
     let key = dest_va & !0xFF;
     if key == 0 {
@@ -3660,6 +3809,7 @@ unsafe fn record_build_tlas(
         STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
         return false;
     };
+    let mut pre_patch_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(3);
     if state.hash_dirty.is_dirty() {
         let Some((upload_buf, upload_ptr)) = sub.ensure_hash_upload(host) else {
             STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
@@ -3670,11 +3820,17 @@ unsafe fn record_build_tlas(
             // SAFETY: `upload_ptr` maps `HASH_TABLE_BYTES` matching `state.blas_table`.
             unsafe {
                 if *hash_in_srv {
-                    list.ResourceBarrier(&[transition(
+                    let mut pre_copy: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(2);
+                    if *pending_uav {
+                        pre_copy.push(uav_barrier(None));
+                        *pending_uav = false;
+                    }
+                    pre_copy.push(transition(
                         &hash_gpu_buf,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         D3D12_RESOURCE_STATE_COPY_DEST,
-                    )]);
+                    ));
+                    list.ResourceBarrier(&pre_copy);
                 }
                 for (start_slot, end_slot) in ranges {
                     let byte_off = (start_slot * 16) as u64;
@@ -3686,12 +3842,12 @@ unsafe fn record_build_tlas(
                     );
                     list.CopyBufferRegion(&hash_gpu_buf, byte_off, &upload_buf, byte_off, byte_len);
                 }
-                list.ResourceBarrier(&[transition(
-                    &hash_gpu_buf,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                )]);
             }
+            pre_patch_barriers.push(transition(
+                &hash_gpu_buf,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            ));
             *hash_in_srv = true;
         }
     }
@@ -3709,6 +3865,10 @@ unsafe fn record_build_tlas(
         {
             let prev_raw = sub.host_instances.as_ref().map(|(b, _)| b.as_raw());
             let Some((inst_buf, inst_gpu)) = sub.ensure_host_instances(host, inst_bytes) else {
+                if !pre_patch_barriers.is_empty() {
+                    // SAFETY: open list; `hash_gpu_buf` lives in `DxrState`.
+                    unsafe { list.ResourceBarrier(&pre_patch_barriers) };
+                }
                 STATS[STAT_SKIPPED].fetch_add(1, Ordering::Relaxed);
                 return false;
             };
@@ -3721,13 +3881,21 @@ unsafe fn record_build_tlas(
             sub.kept_shadows.push(guest_shadow);
             // SAFETY: open list; all root views and buffers live through submission.
             unsafe {
+                if *pending_uav {
+                    pre_patch_barriers.push(uav_barrier(None));
+                    *pending_uav = false;
+                }
                 if *host_inst_in_srv {
-                    list.ResourceBarrier(&[transition(
+                    pre_patch_barriers.push(transition(
                         &inst_buf,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    )]);
+                    ));
                     *host_inst_in_srv = false;
+                }
+                if !pre_patch_barriers.is_empty() {
+                    list.ResourceBarrier(&pre_patch_barriers);
+                    pre_patch_barriers.clear();
                 }
                 list.SetComputeRootSignature(&pass.root);
                 list.SetPipelineState(&pass.pso);
@@ -3752,6 +3920,14 @@ unsafe fn record_build_tlas(
         }
     } else {
         effective_instances = 0;
+    }
+    if !pre_patch_barriers.is_empty() {
+        if *pending_uav {
+            pre_patch_barriers.push(uav_barrier(None));
+            *pending_uav = false;
+        }
+        // SAFETY: open list; `hash_gpu_buf` lives in `DxrState`.
+        unsafe { list.ResourceBarrier(&pre_patch_barriers) };
     }
 
     // Always rebuild TLAS from scratch with PREFER_FAST_TRACE: D3D12 forbids TLAS
@@ -3815,12 +3991,16 @@ unsafe fn record_build_tlas(
     };
     // SAFETY: open list4; dest, src, scratch, host_instances, and postbuild buffers live.
     unsafe {
+        if *pending_uav {
+            list.ResourceBarrier(&[uav_barrier(None)]);
+            *pending_uav = false;
+        }
         list4.BuildRaytracingAccelerationStructure(
             &desc,
             (!host_postbuild.is_empty()).then_some(host_postbuild.as_slice()),
         );
-        list.ResourceBarrier(&[uav_barrier(None)]);
     }
+    *pending_uav = true;
     if !*built_tlas {
         state.tlas_build_epoch = state.tlas_build_epoch.saturating_add(1);
         *built_tlas = true;
@@ -4293,8 +4473,9 @@ mod tests {
         assert_eq!(alloc.slabs[0].free, vec![(0, 512)]);
 
         let (total, free) = alloc.stats();
-        assert_eq!(total, AS_SLAB_SIZE);
-        assert_eq!(free, (AS_SLAB_SIZE - 1280) + 512);
+        let expected_slab = as_slab_size();
+        assert_eq!(total, expected_slab);
+        assert_eq!(free, (expected_slab - 1280) + 512);
     }
 
     #[test]
@@ -4376,5 +4557,99 @@ mod tests {
         // Reclaimed 256 KiB hole is immediately reused by the next static BLAS allocation.
         let (_, reused, _) = alloc.alloc_with(256 * 1024, make).unwrap();
         assert_eq!(reused, uncompacted);
+    }
+
+    #[test]
+    fn resolve_capabilities_dxr_supported_and_requested() {
+        // State 1: DXR 1.1 supported + requested -> native RT enabled.
+        let dual = resolve_capabilities(true, true, true, false);
+        assert_eq!(
+            dual,
+            RayTracingCapabilities {
+                native_rt_requested: true,
+                native_rt_supported: true,
+                native_rt_enabled: true,
+                software_bvh_enabled: true,
+            }
+        );
+
+        // Suppressing software builder while native RT is enabled disables software BVH.
+        let native_only = resolve_capabilities(true, true, true, true);
+        assert_eq!(
+            native_only,
+            RayTracingCapabilities {
+                native_rt_requested: true,
+                native_rt_supported: true,
+                native_rt_enabled: true,
+                software_bvh_enabled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_capabilities_dxr_unsupported_falls_back_to_software_bvh() {
+        // State 2: DXR 1.1 unsupported + requested -> native RT disabled, falls back to software BVH if requested.
+        let fallback = resolve_capabilities(true, false, true, true);
+        assert_eq!(
+            fallback,
+            RayTracingCapabilities {
+                native_rt_requested: true,
+                native_rt_supported: false,
+                native_rt_enabled: false,
+                software_bvh_enabled: true,
+            }
+        );
+
+        let no_bvh = resolve_capabilities(true, false, false, false);
+        assert_eq!(
+            no_bvh,
+            RayTracingCapabilities {
+                native_rt_requested: true,
+                native_rt_supported: false,
+                native_rt_enabled: false,
+                software_bvh_enabled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_capabilities_neither_available_disables_both() {
+        // State 3: Neither DXR 1.1 nor software BVH builder available -> both disabled.
+        let none = resolve_capabilities(false, false, false, false);
+        assert_eq!(
+            none,
+            RayTracingCapabilities {
+                native_rt_requested: false,
+                native_rt_supported: false,
+                native_rt_enabled: false,
+                software_bvh_enabled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_capabilities_native_rt_not_requested_disables_native_rt() {
+        // State 4: Native RT not requested (even when DXR 1.1 is supported) -> native RT disabled.
+        let sw_only = resolve_capabilities(false, true, true, true);
+        assert_eq!(
+            sw_only,
+            RayTracingCapabilities {
+                native_rt_requested: false,
+                native_rt_supported: true,
+                native_rt_enabled: false,
+                software_bvh_enabled: true,
+            }
+        );
+
+        let all_off = resolve_capabilities(false, true, false, false);
+        assert_eq!(
+            all_off,
+            RayTracingCapabilities {
+                native_rt_requested: false,
+                native_rt_supported: true,
+                native_rt_enabled: false,
+                software_bvh_enabled: false,
+            }
+        );
     }
 }

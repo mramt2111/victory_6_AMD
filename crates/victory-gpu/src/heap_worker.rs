@@ -52,7 +52,12 @@ pub(crate) static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// One upload list holds at most this much texture memory, or this many
 /// milliseconds of work, so that its textures show soon.
 const LIST_BYTES: u64 = 48 << 20;
+const LOW_END_LIST_BYTES: u64 = 16 << 20;
 const LIST_MS: u128 = 40;
+
+fn list_bytes() -> u64 {
+    if crate::residency::low_end_ram() { LOW_END_LIST_BYTES } else { LIST_BYTES }
+}
 
 /// A view to give a host slot once its texture's upload is in the queue:
 /// the title's heap, the slot, the record's handle, and the record's key as
@@ -145,7 +150,7 @@ impl Batch {
     /// and handed over when it holds enough.
     pub(crate) fn uploaded(&mut self, bytes: u64) {
         self.bytes += bytes;
-        if self.bytes >= LIST_BYTES || self.began.elapsed().as_millis() >= LIST_MS {
+        if self.bytes >= list_bytes() || self.began.elapsed().as_millis() >= LIST_MS {
             self.flush();
         }
     }

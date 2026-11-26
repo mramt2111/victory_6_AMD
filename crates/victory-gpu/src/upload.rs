@@ -19,6 +19,11 @@ use std::sync::{Mutex, OnceLock};
 const BLOCK: usize = 64 << 10;
 /// An arena's size, if one request does not need more.
 const ARENA: usize = 4 << 20;
+const LOW_END_ARENA: usize = 1 << 20;
+
+fn arena_bytes() -> usize {
+    if crate::residency::low_end_ram() { LOW_END_ARENA } else { ARENA }
+}
 
 struct Arena {
     at: usize,
@@ -99,7 +104,7 @@ impl Upload {
         let (a, first) = match found {
             Some(place) => place,
             None => {
-                let blocks = n.max(ARENA / BLOCK);
+                let blocks = n.max(arena_bytes() / BLOCK);
                 let at = reserve(blocks * BLOCK)?;
                 crate::shadow::register(at, at as u64, (blocks * BLOCK) as u64);
                 tracing::info!(at = format_args!("{at:#x}"), bytes = blocks * BLOCK, "memory for lists' uploads, where shaders reach it by address");

@@ -117,7 +117,13 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
             }
         }
     }
-    let most = if crate::residency::limited_host_ram() { 32 << 20 } else { MOST };
+    let most = if crate::residency::low_end_ram() {
+        16 << 20
+    } else if crate::residency::limited_host_ram() {
+        32 << 20
+    } else {
+        MOST
+    };
     if !crate::residency::allow_staging_growth(false)
         || BYTES.load(Relaxed) >= most
         || copy.flags() & 0x7 != 0
@@ -230,7 +236,8 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
                     })
                     .ok()?
             };
-            for n in 0..2 {
+            let count = if crate::residency::low_end_cpu() { 1 } else { 2 };
+            for n in 0..count {
                 let worker = Worker::new(&host.device, queue.clone()).ok()?;
                 std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
             }

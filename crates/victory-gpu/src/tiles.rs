@@ -131,6 +131,7 @@ pub(crate) fn given_total() -> u64 {
 struct Heap {
     heap: ID3D12Heap,
     free: Vec<(u32, u32)>,
+    free_count: u32,
 }
 
 // SAFETY: a heap of the device, named only in queue and device calls, which
@@ -139,7 +140,25 @@ unsafe impl Send for Heap {}
 
 impl Heap {
     fn free_tiles(&self) -> u32 {
-        self.free.iter().map(|run| run.1).sum()
+        self.free_count
+    }
+
+    fn coalesce_free(&mut self) {
+        if self.free.len() <= 1 {
+            return;
+        }
+        self.free.sort_unstable();
+        let mut write = 0usize;
+        for read in 1..self.free.len() {
+            let (from, tiles) = self.free[read];
+            if self.free[write].0 + self.free[write].1 == from {
+                self.free[write].1 += tiles;
+            } else {
+                write += 1;
+                self.free[write] = (from, tiles);
+            }
+        }
+        self.free.truncate(write + 1);
     }
 }
 
@@ -149,9 +168,14 @@ static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
 
 /// `count` tiles of one heap, in as many runs as it takes, the lowest free
 /// tiles first (single free tiles are used up before a long run is cut):
-/// the heap, its place in the pool and the runs (first tile, tiles). A new
-/// heap is made when no heap has that many free.
-fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
+/// the heap and its place in the pool, writing the runs (first tile, tiles)
+/// into `runs`. A new heap is made when no heap has that many free.
+fn take_into(
+    device: &ID3D12Device,
+    count: u32,
+    runs: &mut Vec<(u32, u32)>,
+) -> Option<(ID3D12Heap, usize)> {
+    runs.clear();
     if count == 0 || count > HEAP_TILES {
         return None;
     }
@@ -178,6 +202,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
             let fresh = Heap {
                 heap: made?,
                 free: vec![(0, HEAP_TILES)],
+                free_count: HEAP_TILES,
             };
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
             match pool.iter().position(Option::is_none) {
@@ -193,20 +218,40 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         }
     };
     let h = pool[index].as_mut()?;
-    let mut runs = Vec::new();
     let mut left = count;
+    let mut consumed = 0usize;
     while left > 0 {
-        let &(start, tiles) = h.free.first()?;
+        let &(start, tiles) = h.free.get(consumed)?;
         let part = tiles.min(left);
         runs.push((start, part));
         if part == tiles {
-            h.free.remove(0);
+            consumed += 1;
         } else {
-            h.free[0] = (start + part, tiles - part);
+            h.free[consumed] = (start + part, tiles - part);
         }
         left -= part;
     }
-    Some((h.heap.clone(), index, runs))
+    if consumed > 0 {
+        drop(h.free.drain(..consumed));
+    }
+    h.free_count -= count;
+    Some((h.heap.clone(), index))
+}
+
+#[cfg(test)]
+fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
+    let mut runs = Vec::with_capacity(1);
+    let (heap, index) = take_into(device, count, &mut runs)?;
+    Some((heap, index, runs))
+}
+
+fn maybe_release_heap(pool: &mut [Option<Heap>], index: usize) {
+    let all_free = pool[index].as_ref().is_some_and(|h| h.free_tiles() == HEAP_TILES);
+    if all_free && pool.iter().flatten().nth(1).is_some() {
+        pool[index] = None;
+        STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+        STATS[8].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Gives the runs `runs` of the pool's heap at `index` back; runs that
@@ -214,27 +259,19 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
 /// unless it is the pool's only one. (Called when the texture that held
 /// the tiles is dropped: nothing on the card reads through its mappings
 /// any more, as for any host texture that is dropped.)
+#[cfg(test)]
 fn give_back(index: usize, runs: &[(u32, u32)]) {
+    if runs.is_empty() {
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Some(h)) = pool.get_mut(index) else {
         return;
     };
     h.free.extend_from_slice(runs);
-    h.free.sort_unstable();
-    let mut joined: Vec<(u32, u32)> = Vec::with_capacity(h.free.len());
-    for &(from, tiles) in &h.free {
-        match joined.last_mut() {
-            Some(last) if last.0 + last.1 == from => last.1 += tiles,
-            _ => joined.push((from, tiles)),
-        }
-    }
-    h.free = joined;
-    let all_free = h.free_tiles() == HEAP_TILES;
-    if all_free && pool.iter().flatten().count() > 1 {
-        pool[index] = None;
-        STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
-        STATS[8].fetch_add(1, Ordering::Relaxed);
-    }
+    h.free_count += runs.iter().map(|run| run.1).sum::<u32>();
+    h.coalesce_free();
+    maybe_release_heap(&mut pool, index);
 }
 
 /// What is given so far to one texture.
@@ -286,7 +323,7 @@ impl Tiled {
         let mut packed = D3D12_PACKED_MIP_INFO::default();
         let mut shape = D3D12_TILE_SHAPE::default();
         let mut count = levels;
-        let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); levels as usize];
+        let mut tilings = [D3D12_SUBRESOURCE_TILING::default(); 16];
         // SAFETY: outputs of our own, `count` tilings of them.
         unsafe {
             device.GetResourceTiling(
@@ -406,6 +443,9 @@ impl Tiled {
         levels: u32,
     ) -> bool {
         let levels = levels & self.every_level();
+        if levels == 0 {
+            return false;
+        }
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         let prev = self.card.load(Ordering::Relaxed);
         let changed = self.give_locked(
@@ -449,6 +489,9 @@ impl Tiled {
     /// cover is not what the tiles' last owner left.
     pub(crate) fn claim(&self, levels: u32) -> u32 {
         let fresh = self.without(levels);
+        if fresh == 0 {
+            return 0;
+        }
         fresh & !self.claimed.fetch_or(fresh, Ordering::Relaxed)
     }
 
@@ -461,25 +504,43 @@ impl Tiled {
     /// no zeros; if it is the first whose write gets tiles, what that
     /// write does not cover is what the tiles' last owner left.
     pub(crate) fn unclaim(&self, levels: u32) {
-        self.claimed.fetch_and(!levels, Ordering::Relaxed);
+        if levels != 0 {
+            self.claimed.fetch_and(!levels, Ordering::Relaxed);
+        }
     }
 
     /// Of `levels` (a bit a level), the ones that have no tiles now.
     pub(crate) fn without(&self, levels: u32) -> u32 {
+        if levels == 0 {
+            return 0;
+        }
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.without_locked(&given, levels)
     }
 
     fn without_locked(&self, given: &Given, levels: u32) -> u32 {
-        let first_packed = self.standard.len() as u32;
-        let mut without = 0;
-        for level in 0..self.levels.min(32) {
-            let has = if level < first_packed { given.levels[level as usize] } else { given.packed };
-            if !has {
+        let masked = levels & self.every_level();
+        if masked == 0 {
+            return 0;
+        }
+        let first_packed = (self.standard.len() as u32).min(32);
+        let mut without = 0u32;
+        let mut std_bits = if first_packed == 32 {
+            masked
+        } else {
+            masked & ((1u32 << first_packed) - 1)
+        };
+        while std_bits != 0 {
+            let level = std_bits.trailing_zeros();
+            if !given.levels[level as usize] {
                 without |= 1 << level;
             }
+            std_bits &= std_bits - 1;
         }
-        levels & without
+        if first_packed < 32 && !given.packed {
+            without |= masked & !((1u32 << first_packed) - 1);
+        }
+        without
     }
 
     /// Gives tiles to the levels of `texture` that both `named` and `may`
@@ -516,78 +577,128 @@ impl Tiled {
         named: u32,
         may: u32,
     ) -> bool {
-        let has = |level: u32| level < 32 && named & (1 << level) != 0;
-        let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
         let first_packed = self.standard.len() as u32;
-        // (subresource, tiles, the level if it has tiles of its own) to map now.
-        let mut wanted: Vec<(u32, u32, Option<usize>)> = Vec::new();
-        for level in 0..first_packed {
-            if !given.levels[level as usize] && now(level) {
-                wanted.push((level, self.standard[level as usize], Some(level as usize)));
+        let to_map = named & may & self.every_level();
+        if to_map != 0 {
+            let single_flag = D3D12_TILE_RANGE_FLAG_NONE;
+            let mut runs: Vec<(u32, u32)> = Vec::new();
+            let mut flags = Vec::new();
+            let mut starts: Vec<u32> = Vec::new();
+            let mut counts: Vec<u32> = Vec::new();
+            let mut mapped_calls = 0u64;
+            let mut mapped_micros = 0u64;
+            let mut mapped_tiles = 0u64;
+            let mut mapped_levels = 0u64;
+
+            let mut map_subresource = |given: &mut Given, subresource: u32, tiles: u32, level: Option<usize>| {
+                let Some((heap, index)) = take_into(device, tiles, &mut runs) else {
+                    return;
+                };
+                let at = D3D12_TILED_RESOURCE_COORDINATE {
+                    X: 0,
+                    Y: 0,
+                    Z: 0,
+                    Subresource: subresource,
+                };
+                let size = D3D12_TILE_REGION_SIZE {
+                    NumTiles: tiles,
+                    ..Default::default()
+                };
+                // One region, the subresource's tiles in order, on as many
+                // ranges of the heap as the runs taken.
+                let mut single_start = 0u32;
+                let mut single_count = 0u32;
+                let (flags_ptr, starts_ptr, counts_ptr) = if runs.len() == 1 {
+                    let (start, count) = runs[0];
+                    single_start = start;
+                    single_count = count;
+                    (&raw const single_flag, &raw const single_start, &raw const single_count)
+                } else {
+                    flags.resize(runs.len(), D3D12_TILE_RANGE_FLAG_NONE);
+                    starts.clear();
+                    counts.clear();
+                    starts.reserve(runs.len());
+                    counts.reserve(runs.len());
+                    for &(start, count) in &runs {
+                        starts.push(start);
+                        counts.push(count);
+                    }
+                    (flags.as_ptr(), starts.as_ptr(), counts.as_ptr())
+                };
+                let began = std::time::Instant::now();
+                // SAFETY: a live reserved texture and a live heap of ours; one
+                // region of `tiles` tiles from the subresource's first tile;
+                // `runs.len()` ranges whose counts add up to `tiles`, in three
+                // arrays of that length that live through the call.
+                unsafe {
+                    queue.UpdateTileMappings(
+                        texture,
+                        1,
+                        Some(&raw const at),
+                        Some(&raw const size),
+                        &heap,
+                        runs.len() as u32,
+                        Some(flags_ptr),
+                        Some(starts_ptr),
+                        Some(counts_ptr),
+                        D3D12_TILE_MAPPING_FLAG_NONE,
+                    );
+                }
+                mapped_calls += 1;
+                mapped_micros += began.elapsed().as_micros() as u64;
+                match level {
+                    Some(level) => given.levels[level] = true,
+                    None => given.packed = true,
+                }
+                given.runs.extend(runs.iter().map(|&(start, count)| (index, start, count)));
+                mapped_tiles += u64::from(tiles);
+                mapped_levels += 1;
+            };
+
+            let mut std_bits = if first_packed >= 32 {
+                to_map
+            } else {
+                to_map & ((1u32 << first_packed) - 1)
+            };
+            while std_bits != 0 {
+                let level = std_bits.trailing_zeros();
+                if !given.levels[level as usize] {
+                    map_subresource(given, level, self.standard[level as usize], Some(level as usize));
+                }
+                std_bits &= std_bits - 1;
+            }
+            if self.packed > 0 && !given.packed && first_packed < 32 && (to_map & !((1u32 << first_packed) - 1)) != 0 {
+                map_subresource(given, first_packed, self.packed, None);
+            }
+            if mapped_levels > 0 {
+                STATS[6].fetch_add(mapped_calls, Ordering::Relaxed);
+                STATS[7].fetch_add(mapped_micros, Ordering::Relaxed);
+                STATS[2].fetch_add(mapped_tiles * TILE, Ordering::Relaxed);
+                STATS[5].fetch_add(mapped_levels, Ordering::Relaxed);
             }
         }
-        if self.packed > 0 && !given.packed && (first_packed..self.levels).any(now) {
-            wanted.push((first_packed, self.packed, None));
-        }
-        for (subresource, tiles, level) in wanted {
-            let Some((heap, index, runs)) = take(device, tiles) else {
-                continue;
-            };
-            let at = D3D12_TILED_RESOURCE_COORDINATE {
-                X: 0,
-                Y: 0,
-                Z: 0,
-                Subresource: subresource,
-            };
-            let size = D3D12_TILE_REGION_SIZE {
-                NumTiles: tiles,
-                ..Default::default()
-            };
-            // One region, the subresource's tiles in order, on as many
-            // ranges of the heap as the runs taken.
-            let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; runs.len()];
-            let starts: Vec<u32> = runs.iter().map(|run| run.0).collect();
-            let counts: Vec<u32> = runs.iter().map(|run| run.1).collect();
-            let began = std::time::Instant::now();
-            // SAFETY: a live reserved texture and a live heap of ours; one
-            // region of `tiles` tiles from the subresource's first tile;
-            // `runs.len()` ranges whose counts add up to `tiles`, in three
-            // arrays of that length that live through the call.
-            unsafe {
-                queue.UpdateTileMappings(
-                    texture,
-                    1,
-                    Some(&raw const at),
-                    Some(&raw const size),
-                    &heap,
-                    runs.len() as u32,
-                    Some(flags.as_ptr()),
-                    Some(starts.as_ptr()),
-                    Some(counts.as_ptr()),
-                    D3D12_TILE_MAPPING_FLAG_NONE,
-                );
-            }
-            STATS[6].fetch_add(1, Ordering::Relaxed);
-            STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-            match level {
-                Some(level) => given.levels[level] = true,
-                None => given.packed = true,
-            }
-            for &(start, count) in &runs {
-                given.runs.push((index, start, count));
-            }
-            STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
-            STATS[5].fetch_add(1, Ordering::Relaxed);
-        }
-        let with_tiles = |level: u32| {
-            if level < first_packed {
+        let mut shown = u32::MAX;
+        let mut bits = named & self.every_level();
+        while bits != 0 {
+            let level = bits.trailing_zeros();
+            let has_tiles = if level < first_packed {
                 given.levels[level as usize]
             } else {
                 given.packed
+            };
+            if has_tiles {
+                shown = level;
+                break;
             }
-        };
-        let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
-        self.shown.swap(shown, Ordering::Relaxed) != shown
+            bits &= bits - 1;
+        }
+        let prev_shown = self.shown.load(Ordering::Relaxed);
+        if prev_shown != shown {
+            self.shown.store(shown, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     /// The first level a view of the texture may show; `None` while no
@@ -623,25 +734,44 @@ impl Tiled {
     /// The bytes of the tiles it has now.
     pub(crate) fn given_bytes(&self) -> u64 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        given.runs.iter().map(|run| u64::from(run.2) * TILE).sum()
+        given.runs.iter().map(|run| u64::from(run.2)).sum::<u64>() * TILE
     }
 }
 
 impl Drop for Tiled {
     fn drop(&mut self) {
         let given = self.given.get_mut().unwrap_or_else(|e| e.into_inner());
-        let mut bytes = 0;
-        let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
-        for &(index, start, tiles) in &given.runs {
-            by_heap.entry(index).or_default().push((start, tiles));
-            bytes += u64::from(tiles) * TILE;
-        }
-        for (index, runs) in by_heap {
-            give_back(index, &runs);
+        let mut bytes = 0u64;
+        if !given.runs.is_empty() {
+            given.runs.sort_unstable_by_key(|&(index, _, _)| index);
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let mut i = 0;
+            while i < given.runs.len() {
+                let index = given.runs[i].0;
+                let start = i;
+                while i < given.runs.len() && given.runs[i].0 == index {
+                    bytes += u64::from(given.runs[i].2) * TILE;
+                    i += 1;
+                }
+                if let Some(Some(h)) = pool.get_mut(index) {
+                    let group = &given.runs[start..i];
+                    h.free.reserve(group.len());
+                    let mut returned = 0u32;
+                    for &(_, from, tiles) in group {
+                        h.free.push((from, tiles));
+                        returned += tiles;
+                    }
+                    h.free_count += returned;
+                    h.coalesce_free();
+                    maybe_release_heap(&mut pool, index);
+                }
+            }
         }
         STATS[0].fetch_sub(1, Ordering::Relaxed);
         STATS[1].fetch_sub(self.full, Ordering::Relaxed);
-        STATS[2].fetch_sub(bytes, Ordering::Relaxed);
+        if bytes != 0 {
+            STATS[2].fetch_sub(bytes, Ordering::Relaxed);
+        }
     }
 }
 
@@ -686,10 +816,10 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
 /// the mapping calls cost since the line before.
 pub(crate) fn status() {
     static BEFORE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-    let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
-    if s[4] == 0 {
+    if STATS[4].load(Ordering::Relaxed) == 0 {
         return;
     }
+    let s: [u64; 11] = std::array::from_fn(|i| STATS[i].load(Ordering::Relaxed));
     let calls = s[6] - BEFORE[0].swap(s[6], Ordering::Relaxed);
     let micros = s[7] - BEFORE[1].swap(s[7], Ordering::Relaxed);
     tracing::info!(

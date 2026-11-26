@@ -67,8 +67,19 @@ impl Shard {
     /// (renderer port #7) another asking with a higher number may have
     /// noted it first.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
-        let before = self.written.get(&page).copied().unwrap_or(0);
-        self.written.insert(page, before.max(now));
+        let before = match self.written.entry(page) {
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                let before = *e.get();
+                if now > before {
+                    *e.get_mut() = now;
+                }
+                before
+            }
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(now);
+                0
+            }
+        };
         if parts == WHOLE || !parts_on() {
             if now >= before {
                 self.parts.remove(&page);
@@ -78,9 +89,13 @@ impl Shard {
             return before;
         }
         let all = self.parts.entry(page).or_insert([before; PARTS]);
-        for (k, at) in all.iter_mut().enumerate() {
-            if parts >> k & 1 != 0 {
-                *at = (*at).max(now);
+        let mut mask = parts;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let at = &mut all[k];
+            if now > *at {
+                *at = now;
             }
         }
         before
@@ -173,8 +188,8 @@ impl Notes {
     /// The notes of pages `[first, last)` in page order, `each` of them
     /// until it says no: whether it never did. A part at a time.
     fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
-        match pieces(first, last) {
-            Some(pieces) => pieces.into_iter().all(|(from, to)| {
+        match pieces_iter(first, last) {
+            Some(mut pieces) => pieces.all(|(from, to)| {
                 let s = self.read(shard_of(from));
                 s.written.range(from..to).all(|(&p, &w)| each(p, w))
             }),
@@ -203,7 +218,12 @@ impl Notes {
     /// (`write`) or reading. Taken in order: whoever waits for a part holds
     /// only lower ones, so no two holders wait for each other.
     fn hold(&self, shards: u64, write: bool) -> Held<'_> {
-        let mut held = Held { shards, read: Vec::new(), write: Vec::new() };
+        let count = shards.count_ones() as usize;
+        let mut held = if write {
+            Held { shards, read: Vec::new(), write: Vec::with_capacity(count) }
+        } else {
+            Held { shards, read: Vec::with_capacity(count), write: Vec::new() }
+        };
         let mut m = shards;
         while m != 0 {
             let shard = m.trailing_zeros() as usize;
@@ -231,15 +251,22 @@ impl Notes {
 /// The pieces of pages `[first, last)` in page order, each in one part;
 /// `None` for a range of more pieces than is worth walking (then each part
 /// is looked at once).
+fn pieces_iter(first: usize, last: usize) -> Option<impl Iterator<Item = (usize, usize)>> {
+    let range = if first >= last {
+        0..0
+    } else {
+        let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        if b - a >= 4 * SHARDS {
+            return None;
+        }
+        a..b + 1
+    };
+    Some(range.map(move |piece| (first.max(piece << SHARD_SHIFT), last.min((piece + 1) << SHARD_SHIFT))))
+}
+
+#[cfg(test)]
 fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
-    if first >= last {
-        return Some(Vec::new());
-    }
-    let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
-    if b - a >= 4 * SHARDS {
-        return None;
-    }
-    Some((a..=b).map(|piece| (first.max(piece << SHARD_SHIFT), last.min((piece + 1) << SHARD_SHIFT))).collect())
+    pieces_iter(first, last).map(Iterator::collect)
 }
 
 /// Parts of [`Notes`] held ([`Notes::hold`]).
@@ -270,9 +297,8 @@ impl Held<'_> {
 
     /// The notes of pages `[first, last)` in page order; their parts held.
     fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
-        match pieces(first, last) {
+        match pieces_iter(first, last) {
             Some(pieces) => pieces
-                .into_iter()
                 .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
                 .collect(),
             None => {
@@ -293,8 +319,21 @@ impl Held<'_> {
 /// the asking it took the page at): the parts to take again, a bit for each
 /// 4 KiB, in the same order.
 pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
+    if pages.is_empty() {
+        return Vec::new();
+    }
     let j = journal();
-    pages.iter().map(|&(page, taken)| j.notes.parts_since(page, taken)).collect()
+    let mut out = Vec::with_capacity(pages.len());
+    let mut cur: Option<(usize, std::sync::RwLockReadGuard<'_, Shard>)> = None;
+    for &(page, taken) in pages {
+        let shard = shard_of(page);
+        if cur.as_ref().is_none_or(|c| c.0 != shard) {
+            drop(cur.take());
+            cur = Some((shard, j.notes.read(shard)));
+        }
+        out.push(cur.as_ref().unwrap().1.parts_since(page, taken));
+    }
+    out
 }
 
 /// Numbers the askings; 0 is "never". Counted up with the journal held
@@ -664,7 +703,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             tally(0, 1);
             tally(1, ((last - first) * (PAGE >> 10)) as u64);
         }
-        let mut pages: Vec<(usize, u16)> = Vec::new();
+        let mut pages: Vec<(usize, u16)> = Vec::with_capacity(count.div_ceil(PARTS));
         for &at in &found[..count] {
             let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
             match pages.last_mut() {
@@ -691,18 +730,25 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    if ranges.len() < 2 {
+        return;
+    }
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`. Check before filtering/allocating/sorting.
     if journal().kept {
         return;
     }
-    let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    for (idx, &(start, end)) in ranges.iter().enumerate() {
         // Not view memory known by its bits: the kernel would refuse the
         // asking (and, asked together with others, theirs).
-        .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
-        .collect();
+        if start < end && !published(start, end) && !refused_as_view(start, end) {
+            if pieces.is_empty() {
+                pieces.reserve(ranges.len() - idx);
+            }
+            pieces.push((start / PAGE, end.div_ceil(PAGE)));
+        }
+    }
     if pieces.len() < 2 {
         return;
     }
@@ -729,7 +775,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     let _held = AskingMany::hold(groups.iter().map(|&(_, _, first, last)| (first, last)).collect());
-    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    let (mut asked, mut written) = (Vec::with_capacity(groups.len()), Vec::new());
     for (i, k, _, _) in groups {
         ask_run(&pieces[i..k], &mut asked, &mut written);
     }
@@ -881,9 +927,11 @@ fn ask_early(every: std::time::Duration) {
     let mut round = 0u32;
     let mut idle = 0;
     let mut last = 0u64;
+    let mut most: Vec<(u32, usize)> = Vec::new();
     loop {
         std::thread::sleep(every);
-        let pieces: Vec<usize> = {
+        most.clear();
+        {
             let mut hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
             let now = ASKED.load(Relaxed);
             idle = if now == last { idle + 1 } else { 0 };
@@ -900,13 +948,12 @@ fn ask_early(every: std::time::Duration) {
             }
             // The most written: a piece with a few pages is as dear to ask as
             // one with many.
-            let mut most: Vec<(u32, usize)> = hot.iter().filter(|h| *h.1 >= 16).map(|(&p, &n)| (n, p)).collect();
-            most.sort_unstable_by(|a, b| b.cmp(a));
-            most.into_iter().take(EARLY_MOST).map(|(_, p)| p).collect()
-        };
+            most.extend(hot.iter().filter(|h| *h.1 >= 16).map(|(&p, &n)| (n, p)));
+        }
+        most.sort_unstable_by(|a, b| b.cmp(a));
         let began = std::time::Instant::now();
         let mut asked = 0;
-        for piece in pieces {
+        for &(_, piece) in most.iter().take(EARLY_MOST) {
             // (A submission's asking stands: what it holds is answered from
             // the journal, and costs nothing here.)
             if published(piece * EARLY_PIECE * PAGE, (piece + 1) * EARLY_PIECE * PAGE) {
@@ -995,19 +1042,22 @@ fn ask_rest(ranges: &[(usize, usize)]) {
             rest.push((first, last));
         }
     }
-    let mut holds = rest.clone();
-    sort_coalesce_ahead(&mut holds);
-    let _held = AskingMany::hold(holds);
     let mut written = Vec::new();
-    for (first, last) in rest {
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
-            && let Some(pages) = kernel_written(first, last)
-        {
-            written.extend(pages);
-            ahead.push((first, last));
+    if !rest.is_empty() {
+        let mut holds = rest.clone();
+        sort_coalesce_ahead(&mut holds);
+        let _held = AskingMany::hold(holds);
+        let initial_ahead = ahead.len();
+        for (first, last) in rest {
+            if !ahead[initial_ahead..].iter().any(|&(a, b)| a <= first && last <= b)
+                && let Some(pages) = kernel_written(first, last)
+            {
+                written.extend(pages);
+                ahead.push((first, last));
+            }
         }
+        sort_coalesce_ahead(&mut ahead);
     }
-    sort_coalesce_ahead(&mut ahead);
     note_hot(&written);
     // A number of its own, and the one this asking stands under: between
     // the two parts another thread may have asked about a range of the
@@ -1057,8 +1107,11 @@ pub(crate) fn wrote(at: usize, len: usize) {
         port7_count(P7_SKIPPED, 1);
         return;
     }
+    if len == 0 {
+        return;
+    }
     let mut j = journal_mut();
-    if !j.kept || len == 0 {
+    if !j.kept {
         return;
     }
     let now = next_asking();
@@ -1228,7 +1281,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // now on. (The range is still held: no other asking of any of it came
     // between.)
     if guards_asked && light() {
-        publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
+        publish(&pages);
     }
     Some(answer)
 }
@@ -1281,27 +1334,50 @@ impl Tracked {
         let Some((_, pages)) = writes(from, to, true) else {
             return Vec::new();
         };
-        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         let mut new: Vec<(usize, u64)> = Vec::new();
-        for (page, write) in pages {
-            let last = seen.get(&page).copied();
-            if last.is_some_and(|last| last >= write) || (page * PAGE).max(from) >= ((page + 1) * PAGE).min(to) {
-                continue;
+        {
+            let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+            for (page, write) in pages {
+                if (page * PAGE).max(from) >= ((page + 1) * PAGE).min(to) {
+                    continue;
+                }
+                // Keep partial pages dirty: the caller has not taken the rest.
+                let full = (page * PAGE).max(self.start) >= from
+                    && ((page + 1) * PAGE).min(self.end) <= to;
+                let last = if full {
+                    match seen.entry(page) {
+                        std::collections::btree_map::Entry::Occupied(mut e) => {
+                            let prev = *e.get();
+                            if prev >= write {
+                                continue;
+                            }
+                            *e.get_mut() = write;
+                            prev
+                        }
+                        std::collections::btree_map::Entry::Vacant(e) => {
+                            e.insert(write);
+                            0
+                        }
+                    }
+                } else {
+                    let prev = seen.get(&page).copied();
+                    if prev.is_some_and(|last| last >= write) {
+                        continue;
+                    }
+                    prev.unwrap_or(0)
+                };
+                new.push((page, last));
             }
-            // Keep partial pages dirty: the caller has not taken the rest.
-            if (page * PAGE).max(self.start) >= from
-                && ((page + 1) * PAGE).min(self.end) <= to
-            {
-                seen.insert(page, write);
-            }
-            new.push((page, last.unwrap_or(0)));
+        }
+        if new.is_empty() {
+            return Vec::new();
         }
         // Of a page taken before, the parts written since, where they are
         // known (`VICTORY_TAKE_PARTS=0`: the page).
-        let parts = if crate::toggled!("VICTORY_TAKE_PARTS") { parts_written(&new) } else { vec![WHOLE; new.len()] };
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
-        for (&(page, last), &parts) in new.iter().zip(&parts) {
-            let mut parts = if last == 0 { WHOLE } else { parts };
+        let parts = crate::toggled!("VICTORY_TAKE_PARTS").then(|| parts_written(&new));
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(new.len());
+        for (i, &(page, last)) in new.iter().enumerate() {
+            let mut parts = if last == 0 { WHOLE } else { parts.as_deref().map_or(WHOLE, |p| p[i]) };
             while parts != 0 {
                 let first = parts.trailing_zeros() as usize;
                 let past = first + (!(parts >> first)).trailing_zeros() as usize;
@@ -1451,8 +1527,8 @@ impl Claims {
         got
     }
 
-    fn none() -> Claims {
-        Claims(Vec::new())
+    fn with_capacity(cap: usize) -> Claims {
+        Claims(Vec::with_capacity(cap))
     }
 
     fn holds(&self, block: usize) -> bool {
@@ -1465,6 +1541,36 @@ impl Drop for Claims {
         for &block in &self.0 {
             BUSY.clear(block);
         }
+    }
+}
+
+/// Stack-allocated claim of a single block ([`BUSY`]), let go when dropped.
+struct ClaimOne(usize);
+
+impl ClaimOne {
+    fn wait_for(block: usize) -> ClaimOne {
+        let mut spun = 0u64;
+        let mut tries = 0u32;
+        while !BUSY.try_set(block) {
+            tries += 1;
+            spun += 1;
+            if tries < 64 {
+                std::hint::spin_loop();
+            } else {
+                // Another thread's `VirtualProtect` of the block.
+                std::thread::yield_now();
+            }
+        }
+        if spun != 0 {
+            port6_count(P6_CLAIM_SPINS, spun);
+        }
+        ClaimOne(block)
+    }
+}
+
+impl Drop for ClaimOne {
+    fn drop(&mut self) {
+        BUSY.clear(self.0);
     }
 }
 
@@ -1489,7 +1595,7 @@ fn port6_count(what: usize, n: u64) {
 
 /// Renderer port #6's line of the frame lines, per frame.
 pub(crate) fn port_guard_line(frames: f64) {
-    let n: Vec<f64> = PORT6.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
+    let n = std::array::from_fn::<f64, 8, _>(|i| PORT6[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     if !port_guard() && n.iter().all(|&v| v == 0.0) {
         return;
     }
@@ -1550,17 +1656,95 @@ impl Bits {
         let Some(place) = self.0.get(word / Bits::WORDS) else {
             return;
         };
-        if place.load(Acquire).is_null() {
-            let piece: Box<BitsPiece> = Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Bits::WORDS]);
-            let piece = Box::into_raw(piece);
-            if place.compare_exchange(std::ptr::null_mut(), piece, AcqRel, Acquire).is_err() {
-                // SAFETY: made just now, and another thread's is there.
-                drop(unsafe { Box::from_raw(piece) });
+        let mut piece = place.load(Acquire);
+        if piece.is_null() {
+            let made: Box<BitsPiece> = Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Bits::WORDS]);
+            let made = Box::into_raw(made);
+            piece = match place.compare_exchange(std::ptr::null_mut(), made, AcqRel, Acquire) {
+                Ok(_) => made,
+                Err(there) => {
+                    // SAFETY: made just now, and another thread's is there.
+                    drop(unsafe { Box::from_raw(made) });
+                    there
+                }
+            };
+        }
+        // SAFETY: a piece made above or by another thread, which is never freed.
+        let piece = unsafe { &*piece };
+        piece[word % Bits::WORDS].fetch_or(1 << (block % 64), SeqCst);
+    }
+
+    /// Sets all bits in `[first, last)`.
+    fn set_range(&self, first: usize, last: usize) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
+        let last = last.min(Bits::PIECES * Bits::WORDS * 64).max(first);
+        let mut block = first;
+        while block < last {
+            let word = block / 64;
+            let until = ((word + 1) * 64).min(last);
+            let mask = (u64::MAX >> (64 - (until - block))) << (block % 64);
+            let Some(place) = self.0.get(word / Bits::WORDS) else {
+                break;
+            };
+            let mut piece = place.load(Acquire);
+            if piece.is_null() {
+                let made: Box<BitsPiece> = Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Bits::WORDS]);
+                let made = Box::into_raw(made);
+                piece = match place.compare_exchange(std::ptr::null_mut(), made, AcqRel, Acquire) {
+                    Ok(_) => made,
+                    Err(there) => {
+                        // SAFETY: made just now, and another thread's is there.
+                        drop(unsafe { Box::from_raw(made) });
+                        there
+                    }
+                };
+            }
+            // SAFETY: a piece made above or by another thread, which is never freed.
+            let piece = unsafe { &*piece };
+            piece[word % Bits::WORDS].fetch_or(mask, SeqCst);
+            block = until;
+        }
+    }
+
+    /// Clears all bits in `[first, last)`.
+    fn clear_range(&self, first: usize, last: usize) {
+        let last = last.min(Bits::PIECES * Bits::WORDS * 64).max(first);
+        let mut block = first;
+        while block < last {
+            let word = block / 64;
+            let until = ((word + 1) * 64).min(last);
+            let mask = (u64::MAX >> (64 - (until - block))) << (block % 64);
+            match self.piece(word) {
+                Some(piece) => {
+                    let atom = &piece[word % Bits::WORDS];
+                    if atom.load(std::sync::atomic::Ordering::SeqCst) & mask != 0 {
+                        atom.fetch_and(!mask, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    block = until;
+                }
+                None => block = (word / Bits::WORDS + 1) * Bits::WORDS * 64,
             }
         }
-        if let Some(piece) = self.piece(word) {
-            piece[word % Bits::WORDS].fetch_or(1 << (block % 64), SeqCst);
+    }
+
+    /// How many bits in `[first, last)` are set.
+    fn count_in(&self, first: usize, last: usize) -> usize {
+        let last = last.min(Bits::PIECES * Bits::WORDS * 64).max(first);
+        let mut total = 0usize;
+        let mut block = first;
+        while block < last {
+            let word = block / 64;
+            let until = ((word + 1) * 64).min(last);
+            let mask = (u64::MAX >> (64 - (until - block))) << (block % 64);
+            match self.piece(word) {
+                Some(piece) => {
+                    total += (piece[word % Bits::WORDS].load(std::sync::atomic::Ordering::SeqCst) & mask).count_ones() as usize;
+                    block = until;
+                }
+                None => block = (word / Bits::WORDS + 1) * Bits::WORDS * 64,
+            }
         }
+        total
     }
 
     /// Sets it if it was not set: whether it was not.
@@ -1573,16 +1757,23 @@ impl Bits {
         use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
         let word = block / 64;
         let place = self.0.get(word / Bits::WORDS)?;
-        if place.load(Acquire).is_null() {
-            let piece: Box<BitsPiece> = Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Bits::WORDS]);
-            let piece = Box::into_raw(piece);
-            if place.compare_exchange(std::ptr::null_mut(), piece, AcqRel, Acquire).is_err() {
-                // SAFETY: made just now, and another thread's is there.
-                drop(unsafe { Box::from_raw(piece) });
-            }
+        let mut piece = place.load(Acquire);
+        if piece.is_null() {
+            let made: Box<BitsPiece> = Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Bits::WORDS]);
+            let made = Box::into_raw(made);
+            piece = match place.compare_exchange(std::ptr::null_mut(), made, AcqRel, Acquire) {
+                Ok(_) => made,
+                Err(there) => {
+                    // SAFETY: made just now, and another thread's is there.
+                    drop(unsafe { Box::from_raw(made) });
+                    there
+                }
+            };
         }
         let bit = 1 << (block % 64);
-        self.piece(word).map(|piece| piece[word % Bits::WORDS].fetch_or(bit, SeqCst) & bit != 0)
+        // SAFETY: a piece made above or by another thread, which is never freed.
+        let piece = unsafe { &*piece };
+        Some(piece[word % Bits::WORDS].fetch_or(bit, SeqCst) & bit != 0)
     }
 
     /// Whether it was set; it is not now.
@@ -1640,11 +1831,13 @@ impl Bits {
 
     /// Whether it was set, and is no more.
     fn take(&self, block: usize) -> bool {
-        self.any(block, block + 1) && {
-            let (word, bit) = (block / 64, 1 << (block % 64));
-            self.piece(word)
-                .is_some_and(|piece| piece[word % Bits::WORDS].fetch_and(!bit, std::sync::atomic::Ordering::SeqCst) & bit != 0)
-        }
+        let (word, bit) = (block / 64, 1u64 << (block % 64));
+        let Some(piece) = self.piece(word) else {
+            return false;
+        };
+        let atom = &piece[word % Bits::WORDS];
+        atom.load(std::sync::atomic::Ordering::SeqCst) & bit != 0
+            && atom.fetch_and(!bit, std::sync::atomic::Ordering::SeqCst) & bit != 0
     }
 
     fn clear(&self, block: usize) {
@@ -1828,7 +2021,24 @@ fn open_faulted(at: usize) -> (usize, std::time::Duration) {
     let g = guards_shared();
     let waited = began.elapsed();
     port6_count(P6_FAULT_WAIT_NS, waited.as_nanos() as u64);
-    let mut views: Vec<usize> = vec![block];
+    {
+        let _claim = ClaimOne::wait_for(block);
+        if !g.protected.contains(block) {
+            return (0, waited);
+        }
+        if !g.aliased.contains(block) {
+            let opened = open_given(&g, at, at + 1, None);
+            if opened != 0 {
+                g.opened(block);
+                port6_count(P6_FAULTS, 1);
+            }
+            return (opened, waited);
+        }
+    }
+    let mut views: Vec<usize> = crate::inplace::pages_of(block * BLOCK).into_iter().map(|p| p / BLOCK).collect();
+    views.push(block);
+    views.sort_unstable();
+    views.dedup();
     loop {
         let _claims = Claims::wait_for(&views);
         if !g.protected.contains(block) {
@@ -1861,13 +2071,16 @@ fn open_faulted(at: usize) -> (usize, std::time::Duration) {
 }
 
 /// An asking made blocks of `pages` clean and noted them in the journal.
-fn publish(pages: &[usize]) {
+fn publish(pages: &[(usize, u16)]) {
+    if pages.is_empty() {
+        return;
+    }
     if port_guard() {
         // A block's claim while its bit is set: a fault opening it meanwhile
         // clears the bit after this sets it, never before.
         let g = guards_shared();
-        for &page in pages {
-            let _claim = Claims::wait_for(&[page]);
+        for &(page, _) in pages {
+            let _claim = ClaimOne::wait_for(page);
             if g.clean.contains(page) || g.held.contains(page) {
                 PUBLISHED.set(page);
                 if BESIDE.any(page, page + 1) {
@@ -1878,7 +2091,7 @@ fn publish(pages: &[usize]) {
         return;
     }
     let g = guards();
-    for &page in pages {
+    for &(page, _) in pages {
         if g.clean.contains(page) || g.held.contains(page) {
             PUBLISHED.set(page);
             // (Put there since: whoever did clears the bit after this is
@@ -1955,8 +2168,7 @@ pub fn title_memory_allocated(at: usize, len: usize) {
         return;
     }
     let g = guards();
-    let blocks: Vec<usize> = g.held.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
-    for block in blocks {
+    for block in g.held.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)) {
         g.held.remove(block);
         PUBLISHED.clear(block);
     }
@@ -2094,9 +2306,26 @@ impl Blocks {
     }
 
     fn insert_all(&self, blocks: std::ops::Range<usize>) {
-        for block in blocks {
-            self.insert(block);
+        self.0.set_range(blocks.start, blocks.end);
+    }
+
+    /// Whether every block in `[first, last)` is set (true for empty ranges).
+    fn all_in(&self, first: usize, last: usize) -> bool {
+        let mut block = first;
+        while block < last {
+            let word = block / 64;
+            let until = ((word + 1) * 64).min(last);
+            let mask = (u64::MAX >> (64 - (until - block))) << (block % 64);
+            if self.word(word) & mask != mask {
+                return false;
+            }
+            block = until;
         }
+        true
+    }
+
+    fn count_in(&self, first: usize, last: usize) -> usize {
+        self.0.count_in(first, last)
     }
 
     /// Those of `range`, in order.
@@ -2303,15 +2532,25 @@ impl Guards {
         }
         put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
         let now = std::time::Instant::now();
-        let hot = match opened.get(&block) {
-            // Written again within its rest and a little more: hotter.
-            Some(o) if !hot_rest().is_zero() && now.duration_since(o.at) < o.rest(rest) + std::time::Duration::from_millis(50) => {
-                port6_count(P6_HOT, 1);
-                o.hot.saturating_add(1).min(16)
+        let hot_enabled = !hot_rest().is_zero();
+        match opened.entry(block) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let o = *e.get();
+                // Written again within its rest and a little more: hotter.
+                let hot = if hot_enabled
+                    && now.duration_since(o.at) < o.rest(rest) + std::time::Duration::from_millis(50)
+                {
+                    port6_count(P6_HOT, 1);
+                    o.hot.saturating_add(1).min(16)
+                } else {
+                    0
+                };
+                *e.get_mut() = Opened { at: now, hot };
             }
-            _ => 0,
-        };
-        opened.insert(block, Opened { at: now, hot });
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(Opened { at: now, hot: 0 });
+            }
+        }
     }
 }
 
@@ -2466,11 +2705,15 @@ pub(crate) fn landing(at: usize, len: usize) {
 /// Returns the note's number, and for each 64 KiB block noted the number of
 /// the block's last write before (0: none is known).
 pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, Vec<(usize, u64)>) {
-    let mut before = Vec::with_capacity(spans.len());
+    let mut before;
     let noted;
     // The same pages at other addresses: copies of the memory there have not
     // what was put in either.
-    let elsewhere: Vec<(usize, Vec<usize>)> = spans.iter().flat_map(|&(at, len)| elsewhere(at, len)).collect();
+    let elsewhere: Vec<(usize, Vec<usize>)> = if view_guard() {
+        spans.iter().flat_map(|&(at, len)| elsewhere(at, len)).collect()
+    } else {
+        Vec::new()
+    };
     {
         let frame = crate::frame::current();
         for &page in pages {
@@ -2492,6 +2735,7 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
                 _ => blocks.push((block, part)),
             }
         }
+        before = Vec::with_capacity(blocks.len());
         let others = || elsewhere.iter().flat_map(|(_, others)| others.iter().map(|other| other / PAGE));
         if port_journal() {
             // Renderer port #7: shared, the parts of its pages held.
@@ -2553,9 +2797,9 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
     if len == 0 {
         return false;
     }
+    let (first, last) = (at / BLOCK, (at + len - 1) / BLOCK + 1);
     let g = guards();
-    (at / BLOCK..=(at + len - 1) / BLOCK)
-        .all(|b| !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
+    !g.protected.0.any(first, last) && !g.absent.0.any(first, last) && !g.clean.0.any(first, last)
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -2587,10 +2831,26 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // takes the block out of the set, and it is looked at as any other.
     let unsure: Vec<usize> = {
         let of = |g: &Guards| -> Option<Vec<usize>> {
-            if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
+            if g.clean.all_in(first, last) && !BESIDE.any(first, last) {
                 return None;
             }
-            Some(g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect())
+            let mut unsure = Vec::new();
+            let last_capped = last.min(Bits::PIECES * Bits::WORDS * 64).max(first);
+            let mut word = first / 64;
+            let end_word = last_capped.div_ceil(64);
+            while word < end_word {
+                match g.absent.0.piece(word) {
+                    Some(piece) => {
+                        let bits = piece[word % Bits::WORDS].load(std::sync::atomic::Ordering::SeqCst)
+                            & in_word(word * 64, first, last_capped)
+                            & !g.held.word(word);
+                        unsure.extend(BitsOf(bits).map(|bit| word * 64 + bit));
+                        word += 1;
+                    }
+                    None => word = (word / Bits::WORDS + 1) * Bits::WORDS,
+                }
+            }
+            Some(unsure)
         };
         // (Renderer port #6: shared, a look only. A block a fault opens
         // meanwhile was clean, read-only and unwritten when looked at.)
@@ -2624,7 +2884,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     if port_guard() {
         // (Renderer port #6: known for a view from now on.)
         if !VIEWS.all(first, last) {
-            (first..last).for_each(|block| VIEWS.set(block));
+            VIEWS.set_range(first, last);
         }
         return Some(guard_shared(first, last, &came, rest));
     }
@@ -2756,7 +3016,7 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
 /// claims can be had now, each run, its other views' blocks only where their
 /// claims can be had too.
 fn protect_claimed(g: &Guards, from: usize, to: usize) {
-    let mut claims = Claims::none();
+    let mut claims = Claims::with_capacity(to - from);
     let mut start = None;
     for block in from..to {
         if claims.try_one(block) {
@@ -2964,7 +3224,7 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
         g.clean.insert_all(from..to);
     };
     // Ahead of the protection (`PROTECTED`).
-    (from..to).for_each(|block| PROTECTED.set(block));
+    PROTECTED.set_range(from, to);
     if set(from, to) {
         note(g, from, to);
         return;
@@ -3024,27 +3284,42 @@ fn open_given(g: &Guards, start: usize, end: usize, given: Option<&[usize]>) -> 
     if first >= last {
         return 0;
     }
+    if first + 1 == last && !g.aliased.contains(first) {
+        if g.protected.contains(first) {
+            unguard(g, &[first]);
+            return 1;
+        }
+        return 0;
+    }
     let mut blocks: Vec<usize> = g.protected.range(first..last).collect();
     let here = blocks.len();
-    let aliased: Vec<usize> = g.aliased.range(first..last).collect();
-    if !aliased.is_empty() {
+    if g.aliased.0.any(first, last) {
+        let aliased: Vec<usize> = g.aliased.range(first..last).collect();
         let one = open_one_view();
         for block in aliased {
             g.aliased.remove(block);
-            let others: Vec<usize> = match given {
-                Some(given) => given.to_vec(),
-                None => crate::inplace::pages_of(block * BLOCK).into_iter().map(|p| p / BLOCK).collect(),
-            };
-            for other in others {
+            let mut handle_other = |other: usize| {
                 if one {
                     // Before the first can be written.
                     g.clean.remove(other);
                     PUBLISHED.clear(other);
-                    continue;
+                    return;
                 }
                 g.aliased.remove(other);
                 if !(first..last).contains(&other) && g.protected.contains(other) {
                     blocks.push(other);
+                }
+            };
+            match given {
+                Some(given) => {
+                    for &other in given {
+                        handle_other(other);
+                    }
+                }
+                None => {
+                    for p in crate::inplace::pages_of(block * BLOCK) {
+                        handle_other(p / BLOCK);
+                    }
                 }
             }
         }
@@ -3058,6 +3333,9 @@ fn open_given(g: &Guards, start: usize, end: usize, given: Option<&[usize]>) -> 
 /// Gives write access back to `blocks`, guarded ones.
 fn unguard(g: &Guards, blocks: &[usize]) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    if blocks.is_empty() {
+        return;
+    }
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // All of them before the first can be written: a write through one is a
@@ -3125,8 +3403,7 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
         open(&g, at, at.saturating_add(len));
         if len != 0 {
             // Nothing known of them stands while they are left alone.
-            let absent: Vec<usize> = g.absent.range(first..last).collect();
-            for block in absent {
+            for block in g.absent.range(first..last) {
                 g.absent.remove(block);
                 if g.held.remove(block) {
                     PUBLISHED.clear(block);
@@ -3215,7 +3492,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     {
         let g = guards();
-        let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
+        let guarded = g.protected.count_in(at / BLOCK, end.div_ceil(BLOCK)) as u64;
         if pages {
             WRITTEN[2].fetch_add(guarded, Relaxed);
         }
@@ -3248,7 +3525,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     // that one by its bits takes no lock).
     let g = guards();
     let blocks: Vec<usize> =
-        ranges.iter().flat_map(|&(at, n)| g.protected.range(at / BLOCK..(at + n).div_ceil(BLOCK)).collect::<Vec<_>>()).collect();
+        ranges.iter().flat_map(|&(at, n)| g.protected.range(at / BLOCK..(at + n).div_ceil(BLOCK))).collect();
     #[cfg(feature = "diagnostics")]
     ALIASES[2].fetch_add(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
     unguard(&g, &blocks);
@@ -3515,8 +3792,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
             _ => g.changing.push((first, last)),
         }
     }
-    let blocks: Vec<usize> = g.protected.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
-    for block in blocks {
+    for block in g.protected.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)) {
         g.protected.remove(block);
         g.clean.remove(block);
         PUBLISHED.clear(block);
@@ -3548,16 +3824,17 @@ pub fn title_memory_freed(at: usize, len: usize) {
     if noted >= end {
         return;
     }
-    let absent: Vec<usize> = g.absent.range(first..end).collect();
-    for block in absent {
+    for block in g.absent.range(first..end) {
         g.absent.remove(block);
         if g.held.remove(block) {
             PUBLISHED.clear(block);
         }
     }
-    let foreign: Vec<usize> = g.foreign.range(first..end).copied().collect();
-    for block in foreign {
-        g.foreign.remove(&block);
+    if !g.foreign.is_empty() {
+        let foreign: Vec<usize> = g.foreign.range(first..end).copied().collect();
+        for block in foreign {
+            g.foreign.remove(&block);
+        }
     }
     // (Memory that is still a view is not freed by that call, which fails:
     // it must not stay read-only.)
@@ -3586,13 +3863,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 
 /// What is known of `[first, last)` as view memory ([`VIEWS`]) is forgotten.
 fn forget_views(first: usize, last: usize) {
-    if !VIEWS.any(first, last) {
-        return;
-    }
-    let set: Vec<usize> = VIEWS.set_in(first, last).collect();
-    for block in set {
-        VIEWS.clear(block);
-    }
+    VIEWS.clear_range(first, last);
 }
 
 /// Tells what keeps track of what title memory shows; the guards, with no
@@ -3607,21 +3878,19 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'s
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let absent: Vec<usize> = g.absent.range(range.clone()).collect();
-    for block in absent {
+    for block in g.absent.range(range.clone()) {
         g.absent.remove(block);
         if g.held.remove(block) {
             PUBLISHED.clear(block);
         }
     }
-    let foreign: Vec<usize> = g.foreign.range(range.clone()).copied().collect();
-    for block in foreign {
-        g.foreign.remove(&block);
+    if !g.foreign.is_empty() {
+        let foreign: Vec<usize> = g.foreign.range(range.clone()).copied().collect();
+        for block in foreign {
+            g.foreign.remove(&block);
+        }
     }
-    let aliased: Vec<usize> = g.aliased.range(range).collect();
-    for block in aliased {
-        g.aliased.remove(block);
-    }
+    g.aliased.0.clear_range(range.start, range.end);
     g
 }
 

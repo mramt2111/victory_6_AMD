@@ -5,8 +5,10 @@
 //! user data, root views for the title's root views, static samplers for
 //! the immediate samplers, and directly indexed heaps.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::sync::Arc;
+use std::fmt::Write as _;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -269,7 +271,9 @@ impl GraphicsState {
         } else {
             ""
         };
-        format!(
+        let mut out = String::with_capacity(2048);
+        let _ = write!(
+            out,
             "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
             self.blend,
             self.sample_mask,
@@ -280,7 +284,8 @@ impl GraphicsState {
             self.targets,
             self.depth_format.0,
             self.samples
-        )
+        );
+        out
     }
 
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
@@ -423,7 +428,8 @@ impl HostPipeline {
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
-        super::library::label(format!("{shaders:?}"));
+        let label = format!("{shaders:?}");
+        super::library::label(label.clone());
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -448,46 +454,65 @@ impl HostPipeline {
                 (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
-            let mut stages = vec![first];
-            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            let pixel = find("pixel");
+            let mut stages = Vec::with_capacity(1 + usize::from(pixel.is_some()));
+            stages.push(first);
+            if let Some(ps) = pixel {
+                stages.push((ps, D3D12_SHADER_VISIBILITY_PIXEL));
+            }
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
-        for (s, _) in &stages {
-            s.translated()?;
+        let bounded = bounded_root_srvs();
+        let mut total_params = 0usize;
+        let mut max_ranges = 0usize;
+        let mut total_samplers = 0usize;
+        for &(s, _) in &stages {
+            let t = &s.translated()?.host;
+            total_params += usize::from(t.user_data_dwords() > 0)
+                + t.root_cbvs.len()
+                + t.root_srvs.len()
+                + t.root_uavs.len();
+            if bounded {
+                max_ranges += t.root_srvs.len() + t.root_uavs.len();
+            }
+            total_samplers += t.static_samplers.len();
         }
         let host = host()?;
 
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-        // SAFETY: the feature query writes the structure of the given size.
-        // Older runtimes may not recognize OPTIONS19; that means no support.
-        let aniso_point_mip_supported = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS19,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        }
-        .is_ok()
-            && options.AnisoFilterWithPointMipSupported.as_bool();
+        static ANISO_POINT_MIP: OnceLock<bool> = OnceLock::new();
+        let aniso_point_mip_supported = *ANISO_POINT_MIP.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+            // SAFETY: the feature query writes the structure of the given size.
+            // Older runtimes may not recognize OPTIONS19; that means no support.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS19,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok()
+                && options.AnisoFilterWithPointMipSupported.as_bool()
+        });
 
         // The root signature the translated shaders' bindings define.
-        let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
+        let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::with_capacity(total_params);
         // The ranges table parameters point at, alive until the root
         // signature is made.
-        let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
-        let mut samplers = Vec::new();
-        let mut bound = Vec::new();
+        let mut ranges: Vec<D3D12_DESCRIPTOR_RANGE1> = Vec::with_capacity(max_ranges);
+        let mut samplers = Vec::with_capacity(total_samplers);
+        let mut bound = Vec::with_capacity(stages.len());
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
-                root_cbvs: Vec::new(),
-                root_srvs: Vec::new(),
-                root_uavs: Vec::new(),
+                root_cbvs: Vec::with_capacity(t.root_cbvs.len()),
+                root_srvs: Vec::with_capacity(t.root_srvs.len()),
+                root_uavs: Vec::with_capacity(t.root_uavs.len()),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -533,12 +558,12 @@ impl HostPipeline {
                             || slot == victory_shader::emit::SLOT_TABLE_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
                     };
-                    if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
+                    if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded {
                         // A one-view table: the view's size bounds the
                         // reads (and a root UAV's writes), which a root
                         // descriptor leaves unbounded.
                         // (Our own table of strides stays a descriptor.)
-                        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                        ranges.push(D3D12_DESCRIPTOR_RANGE1 {
                             RangeType: if uav {
                                 D3D12_DESCRIPTOR_RANGE_TYPE_UAV
                             } else {
@@ -550,15 +575,14 @@ impl HostPipeline {
                             Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
                                 | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
                             OffsetInDescriptorsFromTableStart: 0,
-                        }));
-                        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
+                        });
                         out.push((slot, params.len() as u32));
                         params.push(D3D12_ROOT_PARAMETER1 {
                             ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
                             Anonymous: D3D12_ROOT_PARAMETER1_0 {
                                 DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
                                     NumDescriptorRanges: 1,
-                                    pDescriptorRanges: range,
+                                    pDescriptorRanges: std::ptr::null(),
                                 },
                             },
                             ShaderVisibility: visibility,
@@ -598,12 +622,32 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        if !ranges.is_empty() {
+            let mut range_idx = 0usize;
+            for p in &mut params {
+                if p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE {
+                    // SAFETY: `ParameterType` selects `DescriptorTable`, and `ranges` is
+                    // no longer mutated and outlives `root_signature`.
+                    unsafe {
+                        p.Anonymous.DescriptorTable.pDescriptorRanges =
+                            std::ptr::from_ref(&ranges[range_idx]);
+                    }
+                    range_idx += 1;
+                }
+            }
+        }
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
                 return None;
             }
+        };
+        let stage_bytes = |i: usize| -> &[u8] {
+            stages
+                .get(i)
+                .and_then(|(s, _)| s.translated())
+                .map_or(&[], |t| t.host.dxil.as_slice())
         };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
@@ -621,7 +665,7 @@ impl HostPipeline {
                 CS: code(0),
                 ..Default::default()
             };
-            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let name = super::library::name("compute", &root_blob, &[stage_bytes(0)], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -638,14 +682,14 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
+            crate::host::name(&pso, || label.clone());
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
                 pso,
                 root,
                 stages: bound,
-                name: format!("{shaders:?}"),
+                name: label,
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
@@ -679,7 +723,7 @@ impl HostPipeline {
             let name = super::library::name(
                 "mesh triangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[stage_bytes(0), stage_bytes(1)],
                 &state,
             );
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
@@ -691,14 +735,14 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
+            crate::host::name(&pso, || label.clone());
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
                 pso,
                 root,
                 stages: bound,
-                name: format!("{shaders:?}"),
+                name: label,
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
@@ -757,13 +801,13 @@ impl HostPipeline {
             Some(gs) => super::library::name(
                 "graphics rectangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
+                &[stage_bytes(0), stage_bytes(1), &gs[..]],
                 &state,
             ),
             None => super::library::name(
                 "graphics",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[stage_bytes(0), stage_bytes(1)],
                 &state,
             ),
         };
@@ -797,7 +841,7 @@ impl HostPipeline {
             }
         };
         tracing::info!(?shaders, "host pipeline");
-        crate::host::name(&pso, || format!("{shaders:?}"));
+        crate::host::name(&pso, || label.clone());
         tracing::debug!(
             ?shaders,
             depth = ?g.depth,
@@ -814,37 +858,44 @@ impl HostPipeline {
             pso,
             root,
             stages: bound,
-            name: format!("{shaders:?}"),
+            name: label,
             slots: g.slots(),
             inputs: g.elements(),
             rects: rect_gs.is_some(),
             state: {
-                let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
-                let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
+                #[cfg(feature = "diagnostics")]
+                {
+                    let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
+                    let bounds = if depth_bounds { " bounds true" } else { "" };
                     format!(
-                        "fail {} depth-fail {} pass {} func {}",
-                        f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0
+                        "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [fail {} depth-fail {} pass {} func {}] back [fail {} depth-fail {} pass {} func {}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
+                        d.DepthEnable.as_bool(),
+                        d.DepthWriteMask.0,
+                        d.DepthFunc.0,
+                        d.StencilEnable.as_bool(),
+                        d.StencilReadMask,
+                        d.StencilWriteMask,
+                        d.FrontFace.StencilFailOp.0,
+                        d.FrontFace.StencilDepthFailOp.0,
+                        d.FrontFace.StencilPassOp.0,
+                        d.FrontFace.StencilFunc.0,
+                        d.BackFace.StencilFailOp.0,
+                        d.BackFace.StencilDepthFailOp.0,
+                        d.BackFace.StencilPassOp.0,
+                        d.BackFace.StencilFunc.0,
+                        r.CullMode.0,
+                        r.FrontCounterClockwise.as_bool(),
+                        b.BlendEnable.as_bool(),
+                        b.SrcBlend.0,
+                        b.DestBlend.0,
+                        b.BlendOp.0,
+                        b.RenderTargetWriteMask
                     )
-                };
-                let bounds = if depth_bounds { " bounds true" } else { "" };
-                format!(
-                    "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
-                    d.DepthEnable.as_bool(),
-                    d.DepthWriteMask.0,
-                    d.DepthFunc.0,
-                    d.StencilEnable.as_bool(),
-                    d.StencilReadMask,
-                    d.StencilWriteMask,
-                    face(&d.FrontFace),
-                    face(&d.BackFace),
-                    r.CullMode.0,
-                    r.FrontCounterClockwise.as_bool(),
-                    b.BlendEnable.as_bool(),
-                    b.SrcBlend.0,
-                    b.DestBlend.0,
-                    b.BlendOp.0,
-                    b.RenderTargetWriteMask
-                )
+                }
+                #[cfg(not(feature = "diagnostics"))]
+                {
+                    String::new()
+                }
             },
         })
     }
@@ -1014,13 +1065,76 @@ fn mesh_pipeline(
     }
 }
 
-/// The bytes of shader code (none for an absent stage).
-fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
-    if code.pShaderBytecode.is_null() {
-        return Vec::new();
+fn root_signature_key(
+    device: &ID3D12Device,
+    params: &[D3D12_ROOT_PARAMETER1],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+    compute: bool,
+) -> [u8; 32] {
+    use windows::core::Interface;
+    let mut h = blake3::Hasher::new();
+    h.update(&(device.as_raw() as usize).to_le_bytes());
+    h.update(&[u8::from(compute)]);
+    h.update(&(params.len() as u64).to_le_bytes());
+    for p in params {
+        h.update(&p.ParameterType.0.to_le_bytes());
+        h.update(&p.ShaderVisibility.0.to_le_bytes());
+        match p.ParameterType {
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => {
+                // SAFETY: `ParameterType` selects the `Constants` union member.
+                let c = unsafe { p.Anonymous.Constants };
+                h.update(&c.ShaderRegister.to_le_bytes());
+                h.update(&c.RegisterSpace.to_le_bytes());
+                h.update(&c.Num32BitValues.to_le_bytes());
+            }
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => {
+                // SAFETY: `ParameterType` selects the `DescriptorTable` union member.
+                let t = unsafe { p.Anonymous.DescriptorTable };
+                h.update(&t.NumDescriptorRanges.to_le_bytes());
+                if t.NumDescriptorRanges > 0 && !t.pDescriptorRanges.is_null() {
+                    // SAFETY: the caller passes live descriptor ranges for the table.
+                    let ranges = unsafe {
+                        std::slice::from_raw_parts(
+                            t.pDescriptorRanges,
+                            t.NumDescriptorRanges as usize,
+                        )
+                    };
+                    for r in ranges {
+                        h.update(&r.RangeType.0.to_le_bytes());
+                        h.update(&r.NumDescriptors.to_le_bytes());
+                        h.update(&r.BaseShaderRegister.to_le_bytes());
+                        h.update(&r.RegisterSpace.to_le_bytes());
+                        h.update(&r.Flags.0.to_le_bytes());
+                        h.update(&r.OffsetInDescriptorsFromTableStart.to_le_bytes());
+                    }
+                }
+            }
+            _ => {
+                // SAFETY: CBV/SRV/UAV parameter types select the `Descriptor` union member.
+                let d = unsafe { p.Anonymous.Descriptor };
+                h.update(&d.ShaderRegister.to_le_bytes());
+                h.update(&d.RegisterSpace.to_le_bytes());
+                h.update(&d.Flags.0.to_le_bytes());
+            }
+        }
     }
-    // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
+    h.update(&(samplers.len() as u64).to_le_bytes());
+    for s in samplers {
+        h.update(&s.Filter.0.to_le_bytes());
+        h.update(&s.AddressU.0.to_le_bytes());
+        h.update(&s.AddressV.0.to_le_bytes());
+        h.update(&s.AddressW.0.to_le_bytes());
+        h.update(&s.MipLODBias.to_bits().to_le_bytes());
+        h.update(&s.MaxAnisotropy.to_le_bytes());
+        h.update(&s.ComparisonFunc.0.to_le_bytes());
+        h.update(&s.BorderColor.0.to_le_bytes());
+        h.update(&s.MinLOD.to_bits().to_le_bytes());
+        h.update(&s.MaxLOD.to_bits().to_le_bytes());
+        h.update(&s.ShaderRegister.to_le_bytes());
+        h.update(&s.RegisterSpace.to_le_bytes());
+        h.update(&s.ShaderVisibility.0.to_le_bytes());
+    }
+    *h.finalize().as_bytes()
 }
 
 fn root_signature(
@@ -1028,7 +1142,16 @@ fn root_signature(
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
-) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
+) -> windows::core::Result<(ID3D12RootSignature, Arc<[u8]>)> {
+    type RootCache = HashMap<[u8; 32], (ID3D12RootSignature, Arc<[u8]>)>;
+    static CACHE: OnceLock<RwLock<RootCache>> = OnceLock::new();
+
+    let key = root_signature_key(device, params, samplers, compute);
+    let cache = CACHE.get_or_init(|| RwLock::new(HashMap::with_capacity(256)));
+    if let Some((root, blob)) = cache.read().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Ok((root.clone(), Arc::clone(blob)));
+    }
+
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
@@ -1050,7 +1173,7 @@ fn root_signature(
     };
     // SAFETY: the description points at live arrays; the blob is read in
     // full before it is released.
-    unsafe {
+    let created = unsafe {
         let mut blob: Option<ID3DBlob> = None;
         let mut error: Option<ID3DBlob> = None;
         if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
@@ -1066,8 +1189,13 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
-    }
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        (root, Arc::<[u8]>::from(bytes))
+    };
+
+    let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
+    let (root, blob) = guard.entry(key).or_insert(created);
+    Ok((root.clone(), Arc::clone(blob)))
 }
 
 #[cfg(test)]

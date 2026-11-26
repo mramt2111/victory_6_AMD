@@ -267,20 +267,27 @@ struct Call(u32, u64);
 
 fn call(what: &'static str, name: &str) -> Call {
     let (thread, since) = (crate::host::thread_id(), crate::host::now_us());
-    let label = LABEL.with(|l| l.borrow().clone());
+    let full = LABEL.with(|l| {
+        let label = l.borrow();
+        let mut s = String::with_capacity(name.len() + 1 + label.len());
+        s.push_str(name);
+        s.push(' ');
+        s.push_str(&label);
+        s
+    });
     CALLS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((thread, what, format!("{name} {label}"), since));
+        .push((thread, what, full, since));
     Call(thread, since)
 }
 
 impl Drop for Call {
     fn drop(&mut self) {
-        CALLS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|c| (c.0, c.3) != (self.0, self.1));
+        let mut calls = CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = calls.iter().rposition(|c| (c.0, c.3) == (self.0, self.1)) {
+            calls.swap_remove(pos);
+        }
     }
 }
 
@@ -519,17 +526,28 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
-    let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
+    };
+    let mut stack_wide = [0u16; 64];
+    let heap_wide: HSTRING;
+    let wide = if name.is_ascii() && name.len() < stack_wide.len() {
+        for (dst, &b) in stack_wide.iter_mut().zip(name.as_bytes()) {
+            *dst = u16::from(b);
+        }
+        stack_wide[name.len()] = 0;
+        PCWSTR(stack_wide.as_ptr())
+    } else {
+        heap_wide = HSTRING::from(name);
+        PCWSTR(heap_wide.as_ptr())
     };
     let began = std::time::Instant::now();
     let loaded = {
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
-        load(&library.library, PCWSTR(wide.as_ptr()))
+        load(&library.library, wide)
     };
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
@@ -538,8 +556,13 @@ pub(crate) fn pipeline(
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
             crate::host::trail(|| {
-                let label = LABEL.with(|l| l.borrow().clone());
-                format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
+                LABEL.with(|l| {
+                    format!(
+                        "pipeline library: loaded {} in {:.1} ms",
+                        l.borrow(),
+                        began.elapsed().as_secs_f64() * 1e3
+                    )
+                })
             });
             return Ok(pso);
         }
@@ -552,18 +575,20 @@ pub(crate) fn pipeline(
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
-        let label = LABEL.with(|l| l.borrow().clone());
-        format!(
-            "pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
-            began.elapsed().as_secs_f64() * 1e3
-        )
+        LABEL.with(|l| {
+            format!(
+                "pipeline library: made {} in {:.1} ms (the library did not load it: {refused})",
+                l.borrow(),
+                began.elapsed().as_secs_f64() * 1e3
+            )
+        })
     });
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    if unsafe { library.library.StorePipeline(wide, &pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
     Ok(pso)
@@ -573,7 +598,8 @@ pub(crate) fn pipeline(
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(120);
+    const MIN_ADDED: u64 = 64;
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -591,20 +617,26 @@ pub(crate) fn save(now: bool) {
     let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
     let n = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!("{LIBRARY_FILE}.tmp-{}-{n}", std::process::id()));
-    // The bytes of the library written to `tmp`; 0 when no pipeline was
-    // added: the library on disk is then what it was, and only the early
-    // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
-    let bytes = {
+    // The bytes of the library written to `tmp`; 0 when no pipeline rewrite is
+    // due: the library on disk is then what it was, and only the early/slow
+    // lists are written without acquiring `library.saving.write()`.
+    let added_now = library.added.load(Ordering::Relaxed);
+    let rewrite_library = added_now > 0 && (now || added_now >= MIN_ADDED);
+    let bytes = if !rewrite_library {
+        if !USED_CHANGED.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        0
+    } else {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
         let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
-        if !used_changed && added == 0 {
-            return;
-        }
         if added == 0 {
+            if !used_changed {
+                return;
+            }
             0
         } else {
             // SAFETY: a plain query.
@@ -625,7 +657,22 @@ pub(crate) fn save(now: bool) {
     };
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    let (early_count, early_text) = {
+        let guard = used();
+        let mut count = 0usize;
+        let mut text = String::new();
+        if let Some(set) = guard.as_ref() {
+            count = set.len();
+            text.reserve(set.iter().map(|s| s.len() + 1).sum());
+            for (i, key) in set.iter().enumerate() {
+                if i > 0 {
+                    text.push('\n');
+                }
+                text.push_str(key);
+            }
+        }
+        (count, text)
+    };
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -645,14 +692,28 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
+    let slow_text = {
+        use std::fmt::Write;
+        let guard = slow_ones();
+        let mut text = String::new();
+        if let Some(map) = guard.as_ref() {
+            text.reserve(map.len() * 48);
+            for (i, (key, ms)) in map.iter().enumerate() {
+                if i > 0 {
+                    text.push('\n');
+                }
+                let _ = write!(text, "{key} {ms}");
+            }
+        }
+        text
+    };
     let written = library_written
-        .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow_text.as_bytes()))
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), early_text.as_bytes()));
     match written {
         Ok(()) => tracing::info!(
             bytes,
-            early = used.len(),
+            early = early_count,
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -744,9 +805,15 @@ pub(crate) fn note_time(key: &str, ms: u64) {
         return;
     }
     let mut slow = slow_ones();
-    let known = slow.get_or_insert_default().entry(key.to_owned()).or_insert(0);
-    if ms > *known {
-        *known = ms;
+    let map = slow.get_or_insert_default();
+    if let Some(known) = map.get_mut(key) {
+        if ms > *known {
+            *known = ms;
+            // With the next save of the early list.
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
+    } else {
+        map.insert(key.to_owned(), ms);
         // With the next save of the early list.
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
@@ -787,7 +854,8 @@ pub(crate) fn wanted_early(key: &str) -> bool {
 pub(crate) fn note_used(key: &str) {
     let mut used = used();
     let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    if set.len() < EARLY_MAX && !set.contains(key) {
+        set.insert(key.to_owned());
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }

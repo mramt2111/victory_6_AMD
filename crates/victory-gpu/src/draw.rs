@@ -644,26 +644,131 @@ struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
 pub(crate) struct BufferSweep {
     passes: u64,
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
+    // Per-part (`slot % HEAP_ROUND`) cached spans and view counts, so each
+    // frame does not rescan every slot in `ranges`.
+    part_spans: [crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>; HEAP_ROUND as usize],
+    part_views: [u32; HEAP_ROUND as usize],
+    dirty_parts: u16,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self {
+            passes: 0,
+            ranges: HeapRanges(Vec::new()),
+            part_spans: std::array::from_fn(|_| Default::default()),
+            part_views: [0; HEAP_ROUND as usize],
+            dirty_parts: 0,
+            unwatched: Default::default(),
+        }
+    }
+}
+
+impl BufferSweep {
+    fn clear_all(&mut self) {
+        self.ranges.0.clear();
+        for spans in &mut self.part_spans {
+            spans.clear();
+        }
+        self.part_views = [0; HEAP_ROUND as usize];
+        self.dirty_parts = 0;
+    }
+
+    fn forget_part(&mut self, part: u32) {
+        self.ranges.forget_part(part, HEAP_ROUND as u32);
+        let p = part as usize;
+        self.part_spans[p].clear();
+        self.part_views[p] = 0;
+        self.dirty_parts &= !(1u16 << p);
+    }
+
+    fn set(&mut self, slot: u32, range: Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>) {
+        let p = (slot as usize) % (HEAP_ROUND as usize);
+        let old = self.ranges.replace(slot, range.clone());
+        match (&old, &range) {
+            (None, Some(_)) => self.part_views[p] += 1,
+            (Some(_), None) => self.part_views[p] -= 1,
+            _ => {}
+        }
+        if self.dirty_parts & (1u16 << p) != 0 {
+            return;
+        }
+        if let Some((old_shadow, old_from, old_to)) = old {
+            let old_key = std::sync::Arc::as_ptr(&old_shadow) as usize;
+            if let Some((new_shadow, new_from, new_to)) = &range {
+                let new_key = std::sync::Arc::as_ptr(new_shadow) as usize;
+                if old_key == new_key && old_from == *new_from && old_to == *new_to {
+                    return;
+                }
+                if old_key == new_key
+                    && let Some(span) = self.part_spans[p].get_mut(&old_key)
+                    && span.1 < old_from
+                    && old_to < span.2
+                {
+                    span.1 = span.1.min(*new_from);
+                    span.2 = span.2.max(*new_to);
+                    return;
+                }
+            }
+            self.dirty_parts |= 1u16 << p;
+            return;
+        }
+        if let Some((shadow, from, to)) = range {
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            let span = self.part_spans[p].entry(key).or_insert_with(|| (shadow, from, to));
+            span.1 = span.1.min(from);
+            span.2 = span.2.max(to);
+        }
+    }
+
+    fn spans(&mut self) -> (crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>, u32) {
+        let mut dirty = self.dirty_parts;
+        self.dirty_parts = 0;
+        while dirty != 0 {
+            let p = dirty.trailing_zeros() as usize;
+            dirty &= dirty - 1;
+            let part = &mut self.part_spans[p];
+            part.clear();
+            let mut count = 0u32;
+            for (shadow, from, to) in self.ranges.part_ranges(p as u32, HEAP_ROUND as u32) {
+                count += 1;
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let span = part.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
+            self.part_views[p] = count;
+        }
+        let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
+        for part in &self.part_spans {
+            for (&key, (shadow, from, to)) in part {
+                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
+        }
+        let views: u32 = self.part_views.iter().sum();
+        (spans, views)
     }
 }
 
 impl<T> HeapRanges<T> {
+    #[cfg(test)]
     fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
+        let _ = self.replace(slot, range);
+    }
+
+    fn replace(&mut self, slot: u32, range: Option<(T, u64, u64)>) -> Option<(T, u64, u64)> {
         let slot = slot as usize;
         if range.is_none() && slot >= self.0.len() {
-            return;
+            return None;
         }
         if slot >= self.0.len() {
             self.0.resize_with(slot + 1, || None);
         }
-        self.0[slot] = range;
+        std::mem::replace(&mut self.0[slot], range)
     }
 
     /// Forgets the slots of one of `parts` parts
@@ -672,6 +777,11 @@ impl<T> HeapRanges<T> {
         self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
     }
 
+    fn part_ranges(&self, part: u32, parts: u32) -> impl Iterator<Item = &(T, u64, u64)> {
+        self.0.iter().skip(part as usize).step_by(parts as usize).flatten()
+    }
+
+    #[cfg(test)]
     fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
         self.0.iter().flatten()
     }
@@ -899,23 +1009,27 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
-    let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
+    let all = kept.passes == 0 || (kept.passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
-        ranges.0.clear();
+        kept.clear_all();
         host.buffer_slots()
     } else if heap_spread() {
-        // The written ones, and this pass's part of the others.
-        let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
-        ranges.forget_part(part, parts);
+        // The written ones, and this pass's part of the others (deduplicated so
+        // slots in both `part` and `changed` are not looked up twice).
+        let (part, parts) = ((kept.passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
+        kept.forget_part(part);
         let mut slots = host.buffer_slots_of(part, parts);
-        slots.extend(changed);
+        if !changed.is_empty() {
+            slots.extend(changed);
+            slots.sort_unstable();
+            slots.dedup();
+        }
         slots
     } else {
         changed
     };
-    *passes += 1;
+    kept.passes += 1;
     // Whether the device was there before the pass: a view that removes
     // it is named below.
     static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -978,23 +1092,16 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             }
             range
         });
-        ranges.set(index, range);
+        kept.set(index, range);
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
-    // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
-    let mut views = 0u32;
-    for (shadow, from, to) in ranges.ranges() {
-        views += 1;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
-    }
+    // Per host copy, the span its picked views cover (merged from the cached
+    // per-part spans rather than rescanning every slot in `ranges`).
+    let (spans, views) = kept.spans();
     let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
@@ -1008,21 +1115,30 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         std::env::var("VICTORY_UNWATCHED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
     });
     let mut found = Vec::with_capacity(spans.len());
-    let mut next_unwatched = std::collections::HashMap::new();
-    for (shadow, from, to) in spans.values() {
-        if every > 1 && shadow.unwatched() {
-            let id = shadow.id();
-            if let Some(&(last, low, high)) = unwatched.get(&id)
-                && frame >= last && frame - last < every && low <= *from && *to <= high
-            {
-                next_unwatched.insert(id, (last, low, high));
-                continue;
+    if every > 1 {
+        let mut next_unwatched = std::collections::HashMap::new();
+        for (shadow, from, to) in spans.values() {
+            if shadow.unwatched() {
+                let id = shadow.id();
+                if let Some(&(last, low, high)) = kept.unwatched.get(&id)
+                    && frame >= last && frame - last < every && low <= *from && *to <= high
+                {
+                    next_unwatched.insert(id, (last, low, high));
+                    continue;
+                }
+                next_unwatched.insert(id, (frame, *from, *to));
             }
-            next_unwatched.insert(id, (frame, *from, *to));
+            found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
         }
-        found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
+        kept.unwatched = next_unwatched;
+    } else {
+        for (shadow, from, to) in spans.values() {
+            found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
+        }
+        if !kept.unwatched.is_empty() {
+            kept.unwatched.clear();
+        }
     }
-    *unwatched = next_unwatched;
     drop(kept);
     #[cfg(feature = "diagnostics")]
     let refreshed = std::time::Instant::now();
@@ -2574,12 +2690,16 @@ impl State {
         let per_frame = match asked {
             Some(mb) => mb << 20,
             None => {
-                let base = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
-                if crate::residency::limited_host_ram() {
-                    base.min(128 << 20)
-                } else {
-                    base
+                let mut base = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
+                if crate::residency::low_end_ram() {
+                    base = base.min(64 << 20);
+                } else if crate::residency::limited_host_ram() {
+                    base = base.min(128 << 20);
                 }
+                if crate::residency::low_end_vram() {
+                    base = base.min(96 << 20);
+                }
+                base
             }
         };
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -2691,7 +2811,11 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let (per_frame, span) = if catchup && !crate::residency::low_end_ram() && on_time >= 1024 {
+            (per_frame * 3, span * 3)
+        } else {
+            (per_frame, span)
+        };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)

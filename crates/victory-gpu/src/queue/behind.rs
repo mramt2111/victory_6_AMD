@@ -192,8 +192,12 @@ impl<W: Work> Lane<W> {
     /// Adds to the end of the line, and has it looked at.
     pub(super) fn push(&self, queue: usize, what: impl IntoIterator<Item = W>) {
         let what: Vec<W> = what.into_iter().collect();
+        if what.is_empty() {
+            return;
+        }
         let mark = if what.iter().any(W::runs) { W::mark_now() } else { 0 };
         let mut state = self.lock();
+        state.items.reserve(what.len());
         for what in what {
             Self::put(&mut state, queue, what, mark);
         }
@@ -207,14 +211,23 @@ impl<W: Work> Lane<W> {
     /// in between.
     pub(super) fn push_behind(&self, queue: usize, always: bool, what: W, now: impl FnOnce()) {
         let mut state = self.lock();
-        if always || state.running == Some(queue) || state.items.iter().any(|e| e.queue == queue) {
+        let wake = if always || state.running == Some(queue) || state.items.iter().any(|e| e.queue == queue) {
             Self::put(&mut state, queue, what, 0);
+            state.asked += 1;
+            true
         } else {
             now();
-        }
-        state.asked += 1;
+            if !state.items.is_empty() {
+                state.asked += 1;
+                true
+            } else {
+                false
+            }
+        };
         drop(state);
-        self.work.notify_one();
+        if wake {
+            self.work.notify_one();
+        }
     }
 
     /// Has the line looked at: something an entry stands at may have moved.
@@ -231,8 +244,13 @@ impl<W: Work> Lane<W> {
     /// Waits until everything in the line that is free to run has been done
     /// (what comes in after this call may not be).
     pub(super) fn drain(&self) {
-        let folded: Vec<W::Ask> =
-            self.lock().items.iter().filter(|e| e.what.folded()).filter_map(|e| e.what.ask()).collect();
+        let folded: Vec<W::Ask> = {
+            let state = self.lock();
+            if state.items.is_empty() && state.running.is_none() {
+                return;
+            }
+            state.items.iter().filter(|e| e.what.folded()).filter_map(|e| e.what.ask()).collect()
+        };
         folded.iter().for_each(W::settle);
         let mut state = self.lock();
         if state.items.is_empty() && state.running.is_none() {
@@ -297,12 +315,19 @@ impl<W: Work> Lane<W> {
         while self.step(limit) {}
     }
 
-    /// The parts of `entry`, which stands for them, in place `at`.
-    fn unfold(state: &mut State<W>, at: usize, entry: Entry<W>) {
-        let (number, queue, runs, mark) = (entry.number, entry.queue, usize::from(entry.what.runs()), entry.mark);
-        let parts = entry.what.unfold();
-        state.runs -= runs;
+    /// Inserts the already-unfolded parts of a folded entry in place `at`.
+    fn insert_unfolded(
+        state: &mut State<W>,
+        at: usize,
+        number: u64,
+        queue: usize,
+        old_runs: usize,
+        mark: u64,
+        parts: Vec<W>,
+    ) {
+        state.runs -= old_runs;
         state.runs += parts.iter().filter(|p| p.runs()).count();
+        state.items.reserve(parts.len());
         for (i, what) in parts.into_iter().enumerate() {
             state.items.insert(at + i, Entry { number, queue, what, mark });
         }
@@ -312,7 +337,7 @@ impl<W: Work> Lane<W> {
     /// run. Whether there was one. Only one thread calls this.
     fn step(&self, limit: u64) -> bool {
         // Each queue's first entry, oldest first.
-        let mut heads: Vec<(u64, usize, Option<W::Ask>, bool)> = Vec::new();
+        let mut heads: Vec<(u64, usize, Option<W::Ask>, bool)> = Vec::with_capacity(4);
         // Whether one of them stands for others not known yet.
         let mut folded = false;
         {
@@ -339,11 +364,11 @@ impl<W: Work> Lane<W> {
                 // oldest goes on regardless: a wait is not kept across
                 // frames (`super::present`). (Not while there is work whose
                 // parts are not known: it may be what is waited for.)
-                if folded {
+                if folded || !super::forces() {
                     return false;
                 }
-                let state = self.lock();
-                if !super::forces() || !state.items.iter().any(|e| e.number < limit && e.what.shows()) {
+                let has_present = self.lock().items.iter().any(|e| e.number < limit && e.what.shows());
+                if !has_present {
                     return false;
                 }
                 (first, true)
@@ -363,7 +388,7 @@ impl<W: Work> Lane<W> {
         let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()));
         // The highest mark of what it is made of (renderer port #7).
         let mut mark = entry.mark;
-        if entry.what.ask().is_some() && !entry.what.folded() && entry.what.raises() {
+        if !entry.what.folded() && entry.what.raises() && entry.what.ask().is_some() {
             // A wait that goes: what its queue has behind it was written
             // before it was met, which is now at the latest.
             let later = W::mark_later();
@@ -373,10 +398,13 @@ impl<W: Work> Lane<W> {
             // Its parts take its place: behind everything before it, before
             // everything after it (they share its number; the first of them
             // is found first).
+            let (number, queue, old_runs, mark) =
+                (entry.number, entry.queue, usize::from(entry.what.runs()), entry.mark);
+            let parts = entry.what.unfold();
             let mut state = self.lock();
             state.running = None;
-            let at = state.items.iter().position(|e| e.number > entry.number).unwrap_or(state.items.len());
-            Self::unfold(&mut state, at, entry);
+            let at = state.items.iter().position(|e| e.number > number).unwrap_or(state.items.len());
+            Self::insert_unfolded(&mut state, at, number, queue, old_runs, mark, parts);
             drop(state);
             self.moved.notify_all();
             return true;
@@ -395,12 +423,15 @@ impl<W: Work> Lane<W> {
             // (Back where it was: parts of one submission share a number.)
             if next.what.folded() {
                 let free = next.what.ask().is_none_or(|ask| W::met(&ask));
-                let mut state = self.lock();
                 if free {
-                    Self::unfold(&mut state, at, next);
+                    let (number, queue, old_runs, mark) =
+                        (next.number, next.queue, usize::from(next.what.runs()), next.mark);
+                    let parts = next.what.unfold();
+                    let mut state = self.lock();
+                    Self::insert_unfolded(&mut state, at, number, queue, old_runs, mark, parts);
                     continue;
                 }
-                state.items.insert(at, next);
+                self.lock().items.insert(at, next);
                 break;
             }
             let Entry { number, queue, what, mark: theirs } = next;
@@ -579,8 +610,11 @@ impl Work for Job {
             }
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
+                if count >= most || lists.1.len() + order.len() > most_lists {
+                    return Err(next);
+                }
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                if !crate::host::joinable(hosts(), &runs) {
                     return Err(next);
                 }
             }
@@ -823,6 +857,9 @@ pub(super) fn drain() {
 
 /// A submission of `lists` to queue `this`.
 pub(super) fn submit(this: This, lists: &[This]) {
+    if lists.is_empty() {
+        return;
+    }
     let queue = this as usize;
     if crate::list::thin::on() {
         let recordings = crate::list::thin::submitted(lists);
@@ -858,6 +895,9 @@ fn room(queued: u64) {
 
 /// What a submission of `lists` is in the line.
 fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
+    if lists.is_empty() {
+        return Vec::new();
+    }
     let queue = this as usize;
     // In one piece up to the first list that waits for a memory value, as
     // `super::submit_cut` runs them; the rest part by part.
@@ -882,7 +922,10 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
         jobs.push(Job::Run(queue, taken, order));
     }
     if first < lists.len() {
-        for (waits, taken, order) in crate::list::detach_parts(&lists[first..]) {
+        let parts = crate::list::detach_parts(&lists[first..]);
+        let extra: usize = parts.iter().map(|p| p.0.len() + 1).sum();
+        jobs.reserve(extra);
+        for (waits, taken, order) in parts {
             jobs.extend(waits.into_iter().map(Job::Value));
             jobs.push(Job::Run(queue, taken, order));
         }
@@ -927,7 +970,7 @@ pub(super) fn present(
 
 /// For the frame-rate line.
 pub(super) fn line(frames: f64) {
-    let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64).collect();
+    let s: [f64; 11] = std::array::from_fn(|i| STATS[i].swap(0, Relaxed) as f64);
     let ms = |i: usize| s[i] / 1000.0 / frames;
     tracing::info!(
         "submissions prepared by a thread of ours, per frame (VICTORY_ASYNC_SUBMIT): {:.1} in {:.1} presents, {:.1} in the line \

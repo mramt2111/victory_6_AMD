@@ -328,27 +328,38 @@ pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
 }
 
+fn scaled_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4)
+}
+
 /// [`Pool::each`] on threads kept for the title's bytes under flights' writes
-/// (`VICTORY_UNDER_THREADS`, 6 with this one).
+/// (`VICTORY_UNDER_THREADS`, scaled from `(available_parallelism() / 4).clamp(1, 4)`).
 pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
+        let threads = std::env::var("VICTORY_UNDER_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(scaled_threads);
         Pool::new("victory-under", threads.clamp(1, 16))
     })
     .each(count, f);
 }
 
 /// Calls `f` with every number below `count`, on this thread and on threads
-/// kept for making descriptors (`VICTORY_VIEW_THREADS`, 4 with this one, 6 for records; 1:
-/// on this one alone). Those for `records`, the heaps' records copied as
-/// bytes, are others than those for the views picked by index: submissions
-/// wait for the first, lists for the second, and each kept the other waiting.
+/// kept for making descriptors (`VICTORY_VIEW_THREADS`, scaled from
+/// `(available_parallelism() / 4).clamp(1, 4)`; 1: on this one alone). Those
+/// for `records`, the heaps' records copied as bytes, are others than those
+/// for the views picked by index: submissions wait for the first, lists for
+/// the second, and each kept the other waiting.
 pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOLS: [OnceLock<&'static Pool>; 2] = [const { OnceLock::new() }; 2];
     POOLS[usize::from(records)]
         .get_or_init(|| {
-            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if records { 6usize } else { 4 });
+            let threads = std::env::var("VICTORY_VIEW_THREADS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or_else(scaled_threads);
             Pool::new(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16))
         })
         .each(count, f);

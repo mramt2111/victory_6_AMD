@@ -569,7 +569,11 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    known::note(host.key(), &shaders, host.graphics.as_deref());
+    known::note(
+        host.key(),
+        &shaders,
+        host.graphics.lock().unwrap_or_else(|e| e.into_inner()).as_deref(),
+    );
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -905,7 +909,12 @@ mod tests {
         assert_eq!(shaders(p), [("mesh", ms.to_vec()), ("pixel", ps.to_vec())]);
         #[cfg(windows)]
         {
-            let g = pipeline(p).host.graphics.as_deref().unwrap();
+            let guard = pipeline(p)
+                .host
+                .graphics
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let g = guard.as_deref().unwrap();
             assert_eq!(g.topology.0, 3);
             assert_eq!(
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),

@@ -7,6 +7,7 @@
 //! out of a buffer in the card's memory onto the swap chain's buffer.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -149,6 +150,7 @@ fn bpp(format: DXGI_FORMAT) -> Option<usize> {
 }
 
 /// IEEE 754 binary16 encoding for a non-negative float in `[0, 1]`.
+#[inline]
 fn f32_to_f16(v: f32) -> u16 {
     let bits = v.to_bits();
     let exp = ((bits >> 23) & 0xff) as i32 - 127;
@@ -162,6 +164,7 @@ fn f32_to_f16(v: f32) -> u16 {
 }
 
 /// Encodes an RGB colour into `dst` (length == `bpp(format)`).
+#[inline]
 fn encode(format: DXGI_FORMAT, [r, g, b]: [u8; 3], dst: &mut [u8]) {
     match format {
         DXGI_FORMAT_R8G8B8A8_UNORM => dst[..4].copy_from_slice(&[r, g, b, 0xFF]),
@@ -198,6 +201,10 @@ struct Canvas {
 impl Canvas {
     fn new(w: u32, h: u32, fill: [u8; 3]) -> Canvas {
         Canvas { w: w as usize, h: h as usize, rgb: vec![fill; (w * h) as usize] }
+    }
+
+    fn clear(&mut self, fill: [u8; 3]) {
+        self.rgb.fill(fill);
     }
 
     fn rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: [u8; 3]) {
@@ -250,17 +257,16 @@ impl Canvas {
         x
     }
 
-    /// Packs the logical canvas scaled by `scale` into swap-chain bytes.
-    fn pack(&self, scale: u32, format: DXGI_FORMAT, pitch: usize) -> Vec<u8> {
+    /// Packs the logical canvas scaled by `scale` into an existing swap-chain byte buffer.
+    fn pack_into(&self, scale: u32, format: DXGI_FORMAT, pitch: usize, out: &mut [u8]) {
         let bytes = bpp(format).unwrap_or(4);
         let s = scale as usize;
-        let out_h = self.h * s;
-        let mut out = vec![0u8; pitch * out_h];
         let mut enc = [0u8; 8];
         for y in 0..self.h {
             let top = (y * s) * pitch;
-            for x in 0..self.w {
-                encode(format, self.rgb[y * self.w + x], &mut enc[..bytes]);
+            let row = &self.rgb[y * self.w..(y + 1) * self.w];
+            for (x, &rgb) in row.iter().enumerate() {
+                encode(format, rgb, &mut enc[..bytes]);
                 for i in 0..s {
                     let at = top + (x * s + i) * bytes;
                     out[at..at + bytes].copy_from_slice(&enc[..bytes]);
@@ -270,6 +276,13 @@ impl Canvas {
                 out.copy_within(top..top + pitch, top + i * pitch);
             }
         }
+    }
+
+    /// Packs the logical canvas scaled by `scale` into swap-chain bytes.
+    #[cfg(test)]
+    fn pack(&self, scale: u32, format: DXGI_FORMAT, pitch: usize) -> Vec<u8> {
+        let mut out = vec![0u8; pitch * self.h * scale as usize];
+        self.pack_into(scale, format, pitch, &mut out);
         out
     }
 }
@@ -356,6 +369,7 @@ fn system_memory() -> (u64, u64, u64, u64) {
 #[derive(Default)]
 struct CpuMeter {
     prev: Vec<(i64, i64)>,
+    buf: Vec<SysProcPerfInfo>,
     total_pct: f32,
     cores_pct: Vec<f32>,
 }
@@ -386,25 +400,31 @@ impl CpuMeter {
             Some(std::mem::transmute::<_, NtQuery>(p))
         });
         let Some(query) = query else { return };
-        let n = std::thread::available_parallelism().map_or(8, |n| n.get()).min(64);
-        let mut buf = vec![SysProcPerfInfo::default(); n];
+        static CPUS: OnceLock<usize> = OnceLock::new();
+        let n = *CPUS.get_or_init(|| std::thread::available_parallelism().map_or(8, |n| n.get()).min(64));
+        if self.buf.len() < n {
+            self.buf.resize(n, SysProcPerfInfo::default());
+        }
         let mut ret = 0u32;
         // SystemProcessorPerformanceInformation = 8.
         let status = unsafe {
-            query(8, buf.as_mut_ptr().cast(), (buf.len() * size_of::<SysProcPerfInfo>()) as u32, &mut ret)
+            query(8, self.buf.as_mut_ptr().cast(), (n * size_of::<SysProcPerfInfo>()) as u32, &mut ret)
         };
         if status < 0 {
             return;
         }
-        let count = (ret as usize / size_of::<SysProcPerfInfo>()).min(buf.len());
+        let count = (ret as usize / size_of::<SysProcPerfInfo>()).min(n);
         if count == 0 {
             return;
         }
-        let now: Vec<(i64, i64)> = buf[..count].iter().map(|p| (p.idle, p.kernel + p.user)).collect();
         if self.prev.len() == count {
             self.cores_pct.clear();
+            self.cores_pct.reserve(count.saturating_sub(self.cores_pct.capacity()));
             let mut sum = 0.0f32;
-            for (&(pi, pt), &(ni, nt)) in self.prev.iter().zip(&now) {
+            for (prev, p) in self.prev.iter_mut().zip(&self.buf[..count]) {
+                let (pi, pt) = *prev;
+                let (ni, nt) = (p.idle, p.kernel + p.user);
+                *prev = (ni, nt);
                 let dt = (nt - pt).max(1) as f32;
                 let di = (ni - pi).clamp(0, nt - pt) as f32;
                 let busy = ((1.0 - di / dt) * 100.0).clamp(0.0, 100.0);
@@ -412,8 +432,10 @@ impl CpuMeter {
                 sum += busy;
             }
             self.total_pct = sum / count as f32;
+        } else {
+            self.prev.clear();
+            self.prev.extend(self.buf[..count].iter().map(|p| (p.idle, p.kernel + p.user)));
         }
-        self.prev = now;
     }
 }
 
@@ -512,32 +534,44 @@ fn frametime_color(ms: f32) -> [u8; 3] {
     }
 }
 
-fn trunc(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_owned() } else { s[..max].to_owned() }
+fn trunc(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
-/// Paints the full colour HUD canvas.
-fn paint_hud(s: &Snapshot) -> Canvas {
-    let mut c = Canvas::new(BASE_W, BASE_H, BG);
+/// Paints the full colour HUD onto an existing canvas using a reusable text buffer.
+fn paint_hud_into(s: &Snapshot, c: &mut Canvas, buf: &mut String) {
+    c.clear(BG);
     c.border(0, 0, BASE_W, BASE_H, BORDER);
 
     // 1. Large coloured FPS header.
-    let fps_str = format!("{:.0} FPS", s.fps.round());
-    c.text(14, 12, 4, fps_color(s.fps), &fps_str);
+    buf.clear();
+    let _ = write!(buf, "{:.0} FPS", s.fps.round());
+    c.text(14, 12, 4, fps_color(s.fps), buf);
     // Subtle FPS decimal & ms badge on the right of the header.
-    let badge = format!("{:.1} FPS", s.fps);
-    c.text(BASE_W - 14 - badge.len() as u32 * 12, 24, 2, MUTED, &badge);
+    buf.clear();
+    let _ = write!(buf, "{:.1} FPS", s.fps);
+    c.text(BASE_W - 14 - buf.len() as u32 * 12, 24, 2, MUTED, buf);
 
     // 2. Resolution | draws | GPU ms.
-    let row2 = format!("{}X{} | {} DRAWS | GPU {:.1}MS", s.width, s.height, s.draws, s.gpu_ms);
-    c.text_sep(14, 48, 2, WHITE, &trunc(&row2, 43));
+    buf.clear();
+    let _ = write!(buf, "{}X{} | {} DRAWS | GPU {:.1}MS", s.width, s.height, s.draws, s.gpu_ms);
+    c.text_sep(14, 48, 2, WHITE, trunc(buf, 43));
 
     // 3. Frame | submit | 1% low | max.
-    let row3 = format!(
+    buf.clear();
+    let _ = write!(
+        buf,
         "FRAME {:.1} | SUB {:.1} | 1% {:.0} | MAX {:.0}",
         s.frame_ms, s.submit_ms, s.low1_fps, s.max_ms
     );
-    c.text_sep(14, 68, 2, MUTED, &trunc(&row3, 43));
+    c.text_sep(14, 68, 2, MUTED, trunc(buf, 43));
 
     // 4. Live frame-time sparkline graph.
     let (gx, gy, gw, gh) = (12u32, 90u32, BASE_W - 24, 76u32);
@@ -549,11 +583,11 @@ fn paint_hud(s: &Snapshot) -> Canvas {
     let max_scale = if peak > 140.0 { 200.0 } else if peak > 90.0 { 133.0 } else { 100.0 };
 
     // Reference lines at 33 ms (30 FPS) and 66 ms (15 FPS).
-    for &ref_ms in &[33.3f32, 66.7f32] {
+    for &(ref_ms, label) in &[(33.3f32, "33"), (66.7f32, "67")] {
         if ref_ms < max_scale {
             let ly = gy + gh - 2 - ((ref_ms / max_scale) * (gh - 4) as f32) as u32;
             c.rect(gx + 1, ly, gw - 2, 1, GRAPH_GRID);
-            c.text(gx + 4, ly.saturating_sub(8), 1, MUTED, &format!("{:.0}", ref_ms));
+            c.text(gx + 4, ly.saturating_sub(8), 1, MUTED, label);
         }
     }
 
@@ -582,8 +616,9 @@ fn paint_hud(s: &Snapshot) -> Canvas {
 
     // GPU
     c.text(14, 176, 2, LABEL, "GPU");
-    let gpu_line = format!("{} {}%", trunc(&s.gpu_name, max_chars.saturating_sub(5)), s.gpu_pct);
-    c.text(val_x, 176, 2, WHITE, &trunc(&gpu_line, max_chars));
+    buf.clear();
+    let _ = write!(buf, "{} {}%", trunc(&s.gpu_name, max_chars.saturating_sub(5)), s.gpu_pct);
+    c.text(val_x, 176, 2, WHITE, trunc(buf, max_chars));
 
     // VRAM
     c.text(14, 196, 2, LABEL, "VRAM");
@@ -592,23 +627,28 @@ fn paint_hud(s: &Snapshot) -> Canvas {
     } else {
         WHITE
     };
-    let vram_line = format!(
+    buf.clear();
+    let _ = write!(
+        buf,
         "{:.1}/{:.1} GB | SHR {:.1} GB",
         s.vram_used_gb, s.vram_budget_gb, s.vram_shared_gb
     );
-    c.text_sep(val_x, 196, 2, vram_col, &trunc(&vram_line, max_chars));
+    c.text_sep(val_x, 196, 2, vram_col, trunc(buf, max_chars));
 
     // VRAM breakdown (Render Targets | Textures/Pool | Card Buffers | BVH Arenas | Other/Driver)
-    let vram_detail = format!(
+    buf.clear();
+    let _ = write!(
+        buf,
         "RT {:.1} | TX {:.1} | BF {:.1} | BV {:.1} | O {:.1}",
         s.vram_rt_gb, s.vram_tex_gb, s.vram_buf_gb, s.vram_bvh_gb, s.vram_oth_gb
     );
-    c.text_sep(14, 216, 2, MUTED, &trunc(&vram_detail, 43));
+    c.text_sep(14, 216, 2, MUTED, trunc(buf, 43));
 
     // CPU + per-core bars
     c.text(14, 236, 2, LABEL, "CPU");
-    let cpu_line = format!("{} {:.0}%", trunc(&s.cpu_name, max_chars.saturating_sub(5)), s.cpu_pct);
-    c.text(val_x, 236, 2, WHITE, &trunc(&cpu_line, max_chars));
+    buf.clear();
+    let _ = write!(buf, "{} {:.0}%", trunc(&s.cpu_name, max_chars.saturating_sub(5)), s.cpu_pct);
+    c.text(val_x, 236, 2, WHITE, trunc(buf, max_chars));
 
     let cores = s.cores_pct.len().clamp(1, 32);
     let area_w = BASE_W - val_x - 14;
@@ -629,17 +669,27 @@ fn paint_hud(s: &Snapshot) -> Canvas {
 
     // VICTORY
     c.text(14, 288, 2, LABEL, "VICTORY");
-    let vic_line = format!("RAM {:.1} GB | DROP {}", s.proc_ram_gb, s.dropped);
-    c.text_sep(val_x, 288, 2, WHITE, &trunc(&vic_line, max_chars));
+    buf.clear();
+    let _ = write!(buf, "RAM {:.1} GB | DROP {}", s.proc_ram_gb, s.dropped);
+    c.text_sep(val_x, 288, 2, WHITE, trunc(buf, max_chars));
 
     // RAM
     c.text(14, 308, 2, LABEL, "RAM");
-    let ram_line = format!(
+    buf.clear();
+    let _ = write!(
+        buf,
         "{:.1}/{:.1} GB | CMT {:.1}",
         s.sys_ram_used_gb, s.sys_ram_total_gb, s.sys_commit_gb
     );
-    c.text_sep(val_x, 308, 2, WHITE, &trunc(&ram_line, max_chars));
+    c.text_sep(val_x, 308, 2, WHITE, trunc(buf, max_chars));
+}
 
+/// Paints the full colour HUD canvas.
+#[cfg(test)]
+fn paint_hud(s: &Snapshot) -> Canvas {
+    let mut c = Canvas::new(BASE_W, BASE_H, BG);
+    let mut buf = String::with_capacity(64);
+    paint_hud_into(s, &mut c, &mut buf);
     c
 }
 
@@ -656,6 +706,10 @@ struct Buffers {
     fresh: bool,
     /// `card` has already been copied into once and now sits in `COPY_SOURCE`.
     uploaded: bool,
+    /// Reusable software canvas, text formatting buffer, and packed staging buffer.
+    canvas: Canvas,
+    text_buf: String,
+    pack_buf: Vec<u8>,
 }
 
 // SAFETY: free-threaded resources, and memory only written under the presenter's lock.
@@ -688,14 +742,27 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, uploaded: false })
+        Some(Buffers {
+            format,
+            scale,
+            pitch,
+            uploads,
+            card: card?,
+            turn: 0,
+            fresh: false,
+            uploaded: false,
+            canvas: Canvas::new(BASE_W, BASE_H, BG),
+            text_buf: String::with_capacity(64),
+            pack_buf: vec![0u8; bytes as usize],
+        })
     }
 
     fn write(&mut self, snap: &Snapshot) {
-        let picture = paint_hud(snap).pack(self.scale, self.format, self.pitch as usize);
+        paint_hud_into(snap, &mut self.canvas, &mut self.text_buf);
+        self.canvas.pack_into(self.scale, self.format, self.pitch as usize, &mut self.pack_buf);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
-        unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
+        unsafe { std::ptr::copy_nonoverlapping(self.pack_buf.as_ptr(), self.uploads[self.turn].1, self.pack_buf.len()) };
         self.fresh = true;
     }
 }
@@ -710,6 +777,7 @@ pub(super) struct Panel {
     cost: Duration,
     before: Counters,
     history: VecDeque<f32>,
+    scratch_sort: Vec<f32>,
     cpu: CpuMeter,
     last_size: (u32, u32),
     snap: Option<Snapshot>,
@@ -729,6 +797,7 @@ impl Panel {
             cost: Duration::ZERO,
             before: Counters::default(),
             history: VecDeque::with_capacity(HISTORY),
+            scratch_sort: Vec::with_capacity(HISTORY),
             cpu: CpuMeter::default(),
             last_size: (0, 0),
             snap: None,
@@ -783,10 +852,11 @@ impl Panel {
 
         // 1% low FPS from recent history.
         let low1_fps = if !self.history.is_empty() {
-            let mut sorted: Vec<f32> = self.history.iter().copied().collect();
-            sorted.sort_by(|a, b| a.total_cmp(b));
-            let idx = (sorted.len() * 99 / 100).min(sorted.len() - 1);
-            1e3 / f64::from(sorted[idx]).max(0.001)
+            self.scratch_sort.clear();
+            self.scratch_sort.extend(self.history.iter().copied());
+            let idx = (self.scratch_sort.len() * 99 / 100).min(self.scratch_sort.len() - 1);
+            let p99 = *self.scratch_sort.select_nth_unstable_by(idx, |a, b| a.total_cmp(b)).1;
+            1e3 / f64::from(p99).max(0.001)
         } else {
             fps
         };
@@ -809,36 +879,64 @@ impl Panel {
         let (sys_used, sys_total, sys_commit, _) = system_memory();
         let (gpu_name, _) = gpu_info(host);
 
-        self.snap = Some(Snapshot {
-            fps,
-            frame_ms: ms,
-            gpu_ms,
-            gpu_pct,
-            submit_ms,
-            low1_fps,
-            max_ms: self.worst,
-            draws: c[10].round() as u64,
-            dropped: c[8].round() as u64,
-            width: self.last_size.0,
-            height: self.last_size.1,
+        let snap = self.snap.get_or_insert_with(|| Snapshot {
+            fps: 0.0,
+            frame_ms: 0.0,
+            gpu_ms: 0.0,
+            gpu_pct: 0,
+            submit_ms: 0.0,
+            low1_fps: 0.0,
+            max_ms: 0.0,
+            draws: 0,
+            dropped: 0,
+            width: 0,
+            height: 0,
             gpu_name: gpu_name.clone(),
-            vram_used_gb: gb(used),
-            vram_budget_gb: gb(budget),
-            vram_shared_gb: gb(shared),
-            vram_rt_gb: gb(rt_bytes),
-            vram_tex_gb: gb(tex_bytes),
-            vram_buf_gb: gb(buf_bytes),
-            vram_bvh_gb: gb(bvh_bytes),
-            vram_oth_gb: gb(oth_bytes),
+            vram_used_gb: 0.0,
+            vram_budget_gb: 0.0,
+            vram_shared_gb: 0.0,
+            vram_rt_gb: 0.0,
+            vram_tex_gb: 0.0,
+            vram_buf_gb: 0.0,
+            vram_bvh_gb: 0.0,
+            vram_oth_gb: 0.0,
             cpu_name: cpu_name().to_owned(),
-            cpu_pct: self.cpu.total_pct,
-            cores_pct: self.cpu.cores_pct.clone(),
-            proc_ram_gb: gb(private),
-            sys_ram_used_gb: gb(sys_used),
-            sys_ram_total_gb: gb(sys_total),
-            sys_commit_gb: gb(sys_commit),
-            history_ms: self.history.iter().copied().collect(),
+            cpu_pct: 0.0,
+            cores_pct: Vec::with_capacity(self.cpu.cores_pct.len()),
+            proc_ram_gb: 0.0,
+            sys_ram_used_gb: 0.0,
+            sys_ram_total_gb: 0.0,
+            sys_commit_gb: 0.0,
+            history_ms: Vec::with_capacity(HISTORY),
         });
+        snap.fps = fps;
+        snap.frame_ms = ms;
+        snap.gpu_ms = gpu_ms;
+        snap.gpu_pct = gpu_pct;
+        snap.submit_ms = submit_ms;
+        snap.low1_fps = low1_fps;
+        snap.max_ms = self.worst;
+        snap.draws = c[10].round() as u64;
+        snap.dropped = c[8].round() as u64;
+        snap.width = self.last_size.0;
+        snap.height = self.last_size.1;
+        snap.vram_used_gb = gb(used);
+        snap.vram_budget_gb = gb(budget);
+        snap.vram_shared_gb = gb(shared);
+        snap.vram_rt_gb = gb(rt_bytes);
+        snap.vram_tex_gb = gb(tex_bytes);
+        snap.vram_buf_gb = gb(buf_bytes);
+        snap.vram_bvh_gb = gb(bvh_bytes);
+        snap.vram_oth_gb = gb(oth_bytes);
+        snap.cpu_pct = self.cpu.total_pct;
+        snap.cores_pct.clear();
+        snap.cores_pct.extend_from_slice(&self.cpu.cores_pct);
+        snap.proc_ram_gb = gb(private);
+        snap.sys_ram_used_gb = gb(sys_used);
+        snap.sys_ram_total_gb = gb(sys_total);
+        snap.sys_commit_gb = gb(sys_commit);
+        snap.history_ms.clear();
+        snap.history_ms.extend(self.history.iter().copied());
         self.changed = true;
         (self.since, self.frames, self.worst) = (now, 0, 0.0);
         self.cost = now.elapsed();
