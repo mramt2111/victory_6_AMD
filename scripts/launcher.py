@@ -59,6 +59,7 @@ class Launch:
     safe: bool
     ray_tracing: bool
     native_rt: bool
+    low_end: bool
     rebuild: bool
     overrides: dict[str, str]
     runtime: Path | None = None
@@ -151,7 +152,7 @@ def run_windows(session: Launch) -> int:
         "RayTracing": session.ray_tracing,
         "NativeRT": session.native_rt,
         "Rebuild": session.rebuild,
-        "More": session.overrides,
+        "More": ({**({"VICTORY_LOW_END": "1"} if session.low_end else {}), **session.overrides}),
     }
     data = base64.b64encode(json.dumps(payload).encode()).decode()
     command = """
@@ -224,14 +225,17 @@ def run_linux(session: Launch) -> int:
         env["VICTORY_OUTPUT"] = session.output
     if session.fps:
         env["VICTORY_FRAME_INTERVAL_MS"] = str(round(1000 / session.fps, 3))
+    if session.low_end:
+        env["VICTORY_LOW_END"] = "1"
     env.update(session.overrides)
 
     with session.log.open("wb") as log:
         mode = "SAFE" if session.safe else "RDNA FAST"
         rt_tag = " | Native DXR 1.1" if session.native_rt else (" | BVH RT" if session.ray_tracing else "")
+        low_end_tag = " | Low-End" if session.low_end else ""
         out_line = f"  Output : {session.output}\n" if session.output else ""
         header = (
-            f"Launching VIctory Unified through Wine [{mode} | {session.console} | {session.build}{rt_tag}]\n"
+            f"Launching VIctory Unified through Wine [{mode} | {session.console} | {session.build}{rt_tag}{low_end_tag}]\n"
             f"  Binary : {runtime}\n  Game   : {session.game}\n{out_line}  Log    : {session.log}\n"
         )
         log.write(header.encode("utf-8"))
@@ -319,6 +323,7 @@ class Launcher:
         self.safe = tk.BooleanVar()
         self.ray_tracing = tk.BooleanVar()
         self.native_rt = tk.BooleanVar()
+        self.low_end = tk.BooleanVar()
         self.rebuild = tk.BooleanVar()
         self.requested_log = tk.StringVar()
         self.runtime = tk.StringVar()
@@ -436,6 +441,8 @@ class Launcher:
 
         toggles = tk.Frame(controls, bg=PANEL)
         toggles.grid(row=3, columnspan=2, sticky="ew", pady=(7, 3))
+        toggles_row1 = tk.Frame(toggles, bg=PANEL)
+        toggles_row1.pack(fill="x")
         choices = [
             ("Safe mode", self.safe),
             ("Ray tracing (BVH)", self.ray_tracing),
@@ -445,9 +452,16 @@ class Launcher:
             choices.append(("Rebuild before play", self.rebuild))
         for text, value in choices:
             tk.Checkbutton(
-                toggles, text=text, variable=value, bg=PANEL, fg=FG, selectcolor=FIELD,
+                toggles_row1, text=text, variable=value, bg=PANEL, fg=FG, selectcolor=FIELD,
                 activebackground=PANEL, activeforeground=FG, highlightcolor=ACCENT,
             ).pack(side="left", padx=(0, 9))
+        toggles_row2 = tk.Frame(toggles, bg=PANEL)
+        toggles_row2.pack(fill="x", pady=(2, 0))
+        tk.Checkbutton(
+            toggles_row2, text="Low-End Mode (8–12 GB VRAM / 16 GB RAM)", variable=self.low_end,
+            bg=PANEL, fg=FG, selectcolor=FIELD, activebackground=PANEL, activeforeground=FG,
+            highlightcolor=ACCENT,
+        ).pack(side="left", padx=(0, 9))
 
         logs = tk.Frame(details, bg=PANEL)
         logs.pack(fill="x", pady=(4, 4))
@@ -619,6 +633,7 @@ class Launcher:
                 safe=self.safe.get(),
                 ray_tracing=self.ray_tracing.get(),
                 native_rt=self.native_rt.get(),
+                low_end=self.low_end.get(),
                 rebuild=self.rebuild.get(),
                 overrides=parse_overrides(self.overrides.get("1.0", "end")),
                 runtime=Path(runtime).expanduser().resolve() if runtime else None,

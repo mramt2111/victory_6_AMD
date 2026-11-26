@@ -4,6 +4,7 @@
 # -RayTracing   enable ray-tracing BVH builder support
 # -NativeRT     enable native host DXR 1.1 RayQuery acceleration (implies -RayTracing)
 # -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance)
+# -LowEnd       low-end preset for 8-12 GB VRAM / 16 GB RAM (720p, 512px textures, RT off)
 # -Build        target\release (the default) or target\diag
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
@@ -13,6 +14,7 @@ param(
     [switch]$RayTracing,
     [switch]$NativeRT,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
+    [switch]$LowEnd,
     [ValidateSet('release', 'diag')][string]$Build = 'release',
     [hashtable]$More = @{}
 )
@@ -31,7 +33,7 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
     $settings.VICTORY_PORT_CBV = '1'; $settings.VICTORY_PORT_GUARD = '1'; $settings.VICTORY_PORT_JOURNAL = '1'
     $settings.VICTORY_INPLACE = '2'; $settings.VICTORY_HEAP_WORKER = '1'; $settings.VICTORY_JOIN_BARRIERS = '1'
-    $settings.VICTORY_SCOPED_UAV_BARRIERS = '1'; $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
+    $settings.VICTORY_SCOPED_UAV_BARRIERS = '1'; $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $settings.VICTORY_UP_QUEUE = '1'
 }
 if ($RayTracing -or $NativeRT) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($NativeRT) {
@@ -39,6 +41,13 @@ if ($NativeRT) {
     $settings.VICTORY_NATIVE_RT_SUPPRESS_BUILDER = '1'
 }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
+if ($LowEnd) {
+    $settings.VICTORY_LOW_END = '1'
+    $settings.VICTORY_OUTPUT = '1280x720'
+    $settings.VICTORY_TEXTURE_MAX = '512'
+    $settings.VICTORY_NATIVE_RT = '0'
+    $settings.VICTORY_BVH_BUILDER = '0'
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"

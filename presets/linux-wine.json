@@ -1,0 +1,34 @@
+{
+  "name": "linux-wine",
+  "description": "Conservative compatibility preset for Linux under Wine/Proton (vkd3d-proton), disabling aggressive in-place aliasing and separate copy-queue synchronization.",
+  "target_hardware": {
+    "gpu_vram_gb_min": 8,
+    "system_ram_gb_min": 16,
+    "logical_cpus_min": 6
+  },
+  "env": {
+    "VICTORY_OUTPUT": "1920x1080",
+    "VICTORY_UP_QUEUE": "0",
+    "VICTORY_NATIVE_RT": "0",
+    "VICTORY_BVH_BUILDER": "0",
+    "VICTORY_INPLACE": "0",
+    "VICTORY_D3D12_DRED": "light",
+    "VICTORY_PIPELINE_BOOK": "1",
+    "VICTORY_LEVELS_ON_DEMAND": "1",
+    "VICTORY_TEXTURE_NO_WAIT": "1",
+    "VICTORY_RELAY": "2",
+    "VICTORY_RELAY_COPY": "1",
+    "VICTORY_JOIN_COPIES": "1",
+    "VICTORY_MAP_THREADS": "1",
+    "VICTORY_TITLE_PRIORITIES": "0",
+    "VICTORY_AMBIENT": "0.8",
+    "VICTORY_CARD_BUFFERS_MIN_KB": "64",
+    "VICTORY_LOG": "warn"
+  },
+  "keep": [
+    "VICTORY_CONFIG",
+    "VICTORY_GAME_DIR",
+    "VICTORY_CACHE_DIR",
+    "VICTORY_DATA_DIR"
+  ]
+}

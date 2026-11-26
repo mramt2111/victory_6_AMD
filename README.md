@@ -19,7 +19,7 @@ This build combines three community branches into a single tree:
 - **`XboxBvhBuilder.dll` HLE (`crates/victory-hle/src/modules/bvh_builder.rs`):** Intercepts console BVH builder APIs directly rather than emulating dozens of BVH-building compute shaders in software.
 - **Host DXR Acceleration Structure Manager (`crates/victory-gpu/src/dxr.rs`):** Builds and updates native D3D12 multi-geometry static BLASes, dynamic BLASes, and `PREFER_FAST_TRACE` TLASes directly on host RT hardware with topology validation, safe deferred resource retention, and null-TLAS fallback handling.
 - **RDNA 2 → DXIL SM 6.6 `RayQuery` Lifter (`crates/victory-shader/src/emit/rayquery_lift.rs`, `lower.rs`):** Detects `image_bvh*_intersect_ray` traversal loops (opaque, front/back-track, and alpha-tested any-hit loops), coalesces `AllocateRayQuery` handles across disjoint loops, and lifts them into native DXIL Shader Model 6.6 `RayQuery` (`TraceRayInline` / `Proceed` / `Committed*` / `Candidate*`) instructions. Closest-hit `AnyHit` loops default to the inline fallback path on RDNA 4 (opt-in via `VICTORY_NATIVE_RT_ANYHIT=1`) so opaque/shadow passes capture the full hardware speedup without divergent `Proceed()` stalls.
-- **AMD RDNA 4 Stability (`amdxc64.dll`):** Fixes buffer `getDimensions` lowering crashes and validates lifted DXR shaders through `dxil.dll` and host D3D12 PSO creation.
+- **AMD RDNA 4 Stability (`amdxc64.dll`):** AMD RDNA 4 shader translation workaround for driver compiler crashes involving buffer `getDimensions` lowering, with lifted DXR shader validation through `dxil.dll` and host D3D12 PSO creation.
 
 ---
 
@@ -62,11 +62,18 @@ Measured on **AMD Ryzen 7 7800X3D · AMD Radeon RX 9070 XT (16 GB, RDNA 4) · 32
 
 ## Requirements
 
-- **OS:** Windows 10/11 x64 (or Linux + Wine via `launch.sh` / `scripts/launcher.py`)
+- **OS:** Windows 10/11 x64 (or Linux + Wine + VKD3D-Proton via `launch.sh` / `scripts/launcher.py`)
 - **CPU:** x86-64 with AVX2
 - **GPU:** Direct3D 12 GPU with **Shader Model 6.6**, **Mesh Shaders**, and **DXR Tier 1.1** (for `VICTORY_NATIVE_RT=1`)
 - **Build tools:** Rust toolchain (pinned in `rust-toolchain.toml`) and MSVC C++ Build Tools with Windows SDK
+- **Optional GUI launcher:** **Python 3.10+ & Tkinter** (required only for `launch.bat`, `launch.sh`, and `scripts/launcher.py`)
 - **Title files:** Your own dump stored **outside** this repository
+
+### Linux (Wine + VKD3D-Proton) Prerequisites
+
+- **Python 3.10+** and **Tkinter** (for `launch.sh` / `scripts/launcher.py`)
+- **Wine** with both `wine` and `winepath` available on `PATH`, configured with **VKD3D-Proton** for Direct3D 12 support
+- **Windows `victory.exe` binary:** VIctory must be built on Windows (`cargo build --release --locked -p victory`) or downloaded from **GitHub Actions Releases**, then copied into `target/release/victory.exe` (or `target/diag/victory.exe`) inside this repository before launching on Linux
 
 ---
 
@@ -119,6 +126,7 @@ target\release\victory.exe warm --used
 | `VICTORY_NATIVE_RT=1` | Enable native D3D12 DXR 1.1 `RayQuery` lifting & host AS management |
 | `VICTORY_NATIVE_RT_SUPPRESS_BUILDER=1` | Suppress software BVH builder shaders when `VICTORY_NATIVE_RT=1` is active (auto-set in Native RT presets) |
 | `VICTORY_JOIN_BARRIERS=1` | Coalesce redundant D3D12 resource barriers across adjacent commands (enabled in fast presets) |
+| `VICTORY_UP_QUEUE=1` | Offload CPU-to-GPU buffer uploads onto a dedicated D3D12 `COPY` queue (enabled in fast presets; off in `low-end` and safe modes) |
 | `VICTORY_SYNC_IN_PLACE` | Sync descriptor heap pages in place (on by default; set `0` to copy pages first) |
 | `VICTORY_TEXTURE_LOOK_MS` | Poll interval in ms for texture slots waiting on backing memory (default `4000`) |
 | `VICTORY_NATIVE_RT_ANYHIT=1` | Force closest-hit `AnyHit` loops onto `RayQuery` `Proceed()` (default off on RDNA 4) |
@@ -135,10 +143,16 @@ target\release\victory.exe warm --used
 | `VICTORY_COMPILER_GUARD` | Catch driver PSO compiler access violations on worker threads and replace the worker (on by default; `0` to disable) |
 | `VICTORY_WARM_BAD` | Skip pipeline keys recorded in `warm-bad.txt` that previously crashed the driver compiler (on by default; `0` to disable) |
 | `VICTORY_TEXTURE_MAX` | Dynamic mip cap in pixels for streamed placed 2D textures (`0` uncapped; unset auto-caps at `1024`, `512` at ≥92% VRAM, `256` at ≥97%) |
+| `VICTORY_LOW_END=1` | Enable low-end memory preset for 8–12 GB VRAM / 16 GB RAM systems (also `-LowEnd` in `scripts\play.ps1`, `low-end` in `Play-VIctory.cmd`, or the Low-End Mode checkbox in `scripts/launcher.py`) |
+| `VICTORY_WINDOW_BUDGET_MB` | Override the resident window memory budget in MiB (e.g. `512` in low-end presets) |
 | `VICTORY_PANEL=1` | Show the dark F3 telemetry HUD at startup (live 172-frame graph, GPU/VRAM/RAM breakdown, per-core CPU bars; toggle anytime with `F3`) |
 | `VICTORY_CACHE_DIR` | Override local shader/pipeline cache directory (default under `%LOCALAPPDATA%`) |
 
-For additional switches and architecture notes, see [docs/architecture.md](docs/architecture.md), [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md), [docs/findings.md](docs/findings.md), and [docs/README-fxceless.md](docs/README-fxceless.md).
+For additional switches and architecture notes, see [docs/architecture.md](docs/architecture.md) and [docs/findings.md](docs/findings.md).
+
+### Documentation Status
+
+[docs/fork-ray-tracing.md](docs/fork-ray-tracing.md), [docs/README-fxceless.md](docs/README-fxceless.md), and [docs/bug-journal.md](docs/bug-journal.md) are archived upstream development history from earlier forks and are kept for historical reference rather than current usage instructions.
 
 ---
 
