@@ -118,16 +118,20 @@ impl Drop for ActiveGuard {
 /// Removes and returns only the tasks submitted by `queue_id`, preserving FIFO
 /// order for both the drained tasks and those belonging to other queues.
 fn drain_queue(tasks: &mut VecDeque<Task>, queue_id: usize) -> Vec<Task> {
+    let len = tasks.len();
+    if len == 0 {
+        return Vec::new();
+    }
     let mut drained = Vec::new();
-    let mut remaining = VecDeque::with_capacity(tasks.len());
-    while let Some(task) = tasks.pop_front() {
-        if task.queue_id == queue_id {
-            drained.push(task);
-        } else {
-            remaining.push_back(task);
+    for _ in 0..len {
+        if let Some(task) = tasks.pop_front() {
+            if task.queue_id == queue_id {
+                drained.push(task);
+            } else {
+                tasks.push_back(task);
+            }
         }
     }
-    *tasks = remaining;
     drained
 }
 
@@ -178,23 +182,27 @@ impl Port {
     /// The next queued task, waiting up to `timeout_ms`, or until `ended`
     /// (checked whenever the port is woken) says no task will come.
     fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<(Task, ActiveGuard)> {
-        let waiting = |t: &mut VecDeque<Task>| t.is_empty() && !ended();
-        let tasks = lock(&self.tasks);
-        let mut tasks = if timeout_ms == INFINITE {
-            self.ready
-                .wait_while(tasks, waiting)
-                .unwrap_or_else(|e| e.into_inner())
-        } else {
-            let timeout = Duration::from_millis(timeout_ms.into());
-            self.ready
-                .wait_timeout_while(tasks, timeout, waiting)
-                .unwrap_or_else(|e| e.into_inner())
-                .0
-        };
-        tasks.pop_front().map(|task| {
-            let guard = ActiveGuard::enter(task.queue.as_ref());
-            (task, guard)
-        })
+        let mut tasks = lock(&self.tasks);
+        if tasks.is_empty() {
+            if timeout_ms == 0 || ended() {
+                return None;
+            }
+            let waiting = |t: &mut VecDeque<Task>| t.is_empty() && !ended();
+            tasks = if timeout_ms == INFINITE {
+                self.ready
+                    .wait_while(tasks, waiting)
+                    .unwrap_or_else(|e| e.into_inner())
+            } else {
+                let timeout = Duration::from_millis(timeout_ms.into());
+                self.ready
+                    .wait_timeout_while(tasks, timeout, waiting)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+            };
+        }
+        let task = tasks.pop_front()?;
+        let guard = ActiveGuard::enter(task.queue.as_ref());
+        Some((task, guard))
     }
 }
 
@@ -216,7 +224,9 @@ impl Pool {
     fn submit(&'static self, task: Task) {
         let mut state = lock(&self.state);
         state.0.push_back(task);
-        if state.0.len() > state.1 {
+        let spawn = state.0.len() > state.1;
+        drop(state);
+        if spawn {
             std::thread::spawn(move || self.work());
         } else {
             self.ready.notify_one();
@@ -249,6 +259,7 @@ impl Pool {
 pub struct Queue {
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
+    monitor_count: AtomicUsize,
     terminated: AtomicBool,
     /// Delayed callbacks still waiting out their delay, in submission
     /// order: terminating the queue cancels them with the queued ones.
@@ -263,6 +274,7 @@ impl Queue {
         Arc::new(Queue {
             ports,
             monitors: Mutex::default(),
+            monitor_count: AtomicUsize::new(0),
             terminated: AtomicBool::new(false),
             delayed: Mutex::default(),
             active: Mutex::new(0),
@@ -306,6 +318,9 @@ impl Queue {
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
         self.ports[port as usize].submit(task);
+        if self.monitor_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
         for (_, context, callback) in monitors {
@@ -508,7 +523,11 @@ pub fn XTaskQueueRegisterMonitor(
         return E_INVALIDARG;
     }
     let id = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-    lock(&queue.monitors).push((id, context as usize, callback as usize));
+    {
+        let mut monitors = lock(&queue.monitors);
+        monitors.push((id, context as usize, callback as usize));
+        queue.monitor_count.store(monitors.len(), Ordering::Release);
+    }
     // SAFETY: checked non-null.
     unsafe { token.write(id) };
     S_OK
@@ -516,18 +535,26 @@ pub fn XTaskQueueRegisterMonitor(
 
 pub fn XTaskQueueUnregisterMonitor(handle: *const Queue, token: u64) {
     if let Some(queue) = queue(handle) {
-        lock(&queue.monitors).retain(|m| m.0 != token);
+        let mut monitors = lock(&queue.monitors);
+        monitors.retain(|m| m.0 != token);
+        queue.monitor_count.store(monitors.len(), Ordering::Release);
     }
 }
 
 /// A new handle to the process queue, if there is one.
 pub fn XTaskQueueGetCurrentProcessTaskQueue(out: *mut *const Queue) -> bool {
-    let found = process_queue();
+    let Some(found) = process_queue() else {
+        if !out.is_null() {
+            // SAFETY: checked non-null.
+            unsafe { out.write(std::ptr::null()) };
+        }
+        return false;
+    };
     if !out.is_null() {
         // SAFETY: checked non-null.
-        unsafe { out.write(found.clone().map_or(std::ptr::null(), Arc::into_raw)) };
+        unsafe { out.write(Arc::into_raw(found)) };
     }
-    found.is_some()
+    true
 }
 
 pub fn XTaskQueueSetCurrentProcessTaskQueue(handle: *const Queue) {
@@ -645,7 +672,27 @@ pub fn XAsyncBegin(
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if let Some(left) = call(block) {
+    let call = Arc::new(Call {
+        provider,
+        context: context as usize,
+        identity: identity as usize,
+        done: Mutex::new(false),
+        finished: Condvar::new(),
+    });
+    let left = {
+        let mut calls = lock(&CALLS);
+        match calls.entry(block as usize) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let (status, size) = words(block);
+                status.store(E_PENDING as u32 as usize, Ordering::Release);
+                size.store(0, Ordering::Release);
+                entry.insert(call.clone());
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => Some(entry.get().clone()),
+        }
+    };
+    if let Some(left) = left {
         // Calls are filed by block address, and one that succeeded stays
         // filed until its result is taken. A title that never takes it and
         // frees the block may get the same address for its next one, which
@@ -658,18 +705,11 @@ pub fn XAsyncBegin(
             return E_INVALIDARG;
         }
         release(block);
+        let (status, size) = words(block);
+        status.store(E_PENDING as u32 as usize, Ordering::Release);
+        size.store(0, Ordering::Release);
+        lock(&CALLS).insert(block as usize, call.clone());
     }
-    let (status, size) = words(block);
-    status.store(E_PENDING as u32 as usize, Ordering::Release);
-    size.store(0, Ordering::Release);
-    let call = Arc::new(Call {
-        provider,
-        context: context as usize,
-        identity: identity as usize,
-        done: Mutex::new(false),
-        finished: Condvar::new(),
-    });
-    lock(&CALLS).insert(block as usize, call.clone());
     // A failed begin fails the call, so the completion routine still runs.
     let hr = call.provider(OP_BEGIN, block, 0, std::ptr::null_mut());
     if hr < 0 {
@@ -777,7 +817,11 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if wait && let Some(call) = call(block) {
+    let hr = status(block);
+    if !wait || hr != E_PENDING {
+        return hr;
+    }
+    if let Some(call) = call(block) {
         let done = lock(&call.done);
         drop(call.finished.wait_while(done, |d| !*d));
     }
@@ -821,8 +865,9 @@ pub fn XAsyncGetResult(
     if block.is_null() {
         return E_INVALIDARG;
     }
-    let hr = status(block);
-    let size = words(block).1.load(Ordering::Acquire);
+    let (status_word, size_word) = words(block);
+    let hr = status_word.load(Ordering::Acquire) as u32 as i32;
+    let size = size_word.load(Ordering::Acquire);
     if hr < 0 || size == 0 {
         if hr >= 0 && !used.is_null() {
             // SAFETY: checked non-null.

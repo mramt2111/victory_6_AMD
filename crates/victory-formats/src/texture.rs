@@ -179,6 +179,8 @@ pub struct Layout {
     /// Byte offsets inside a block for each coordinate, per axis.
     /// Empty for linear and unsupported modes.
     pattern: &'static SwizzlePattern,
+    /// Intra-block address bitmask for the X axis (`0` for linear/unsupported).
+    x_mask: u32,
 }
 
 type SwizzlePattern = [Vec<u32>; 3];
@@ -240,16 +242,86 @@ fn pattern(kind: usize, element_log2: u32, block_log2: u32) -> [Vec<u32>; 3] {
     axes
 }
 
+/// Branchless F_2 bit-matrix carry-masked increment: advances the counter
+/// encoded in the bit positions selected by `mask` by 1 (wrapping mod
+/// `2^popcount(mask)`), leaving all bits outside `mask` untouched.
+#[inline]
+fn step_masked(addr: u32, mask: u32) -> u32 {
+    ((addr | !mask).wrapping_add(1) & mask) | (addr & !mask)
+}
+
+/// Deposits the lowest `mask.count_ones()` bits of `v` into the bit positions
+/// selected by `mask` (parallel bit deposit / PDEP).
+#[inline]
+#[allow(unused_mut)]
+fn deposit_bits(mut v: u32, mut mask: u32) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        // SAFETY: `target_feature = "bmi2"` is statically enabled on x86_64.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::arch::x86_64::_pdep_u32(v, mask)
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut out = 0u32;
+        while mask != 0 {
+            let lsb = mask & mask.wrapping_neg();
+            out |= lsb & 0u32.wrapping_sub(v & 1);
+            mask &= mask - 1;
+            v >>= 1;
+        }
+        out
+    }
+}
+
+/// Bitmask of intra-block address bits driven by one axis's coordinate bits.
+#[inline]
+fn axis_mask(bits: &[u32]) -> u32 {
+    bits.iter().fold(0u32, |mask, &bit| mask | (1u32 << bit))
+}
+
+/// Intra-block address bitmask for the X axis of a tiled layout.
+fn x_axis_mask(kind: usize, element_log2: u32, block_log2: u32) -> u32 {
+    let mut mask = 0u32;
+    let micro = MICRO[kind][element_log2 as usize];
+    for bit in 0..8u32 {
+        if micro[2 * bit as usize] == b'x' {
+            mask |= 1u32 << bit;
+        }
+    }
+    let order: &[usize] = if kind == 2 { &[1, 0, 2] } else { &[1, 0] };
+    for (bit, &axis) in (8..block_log2).zip(order.iter().cycle()) {
+        if axis == 0 {
+            mask |= 1u32 << bit;
+        }
+    }
+    mask
+}
+
 /// Byte offsets inside a block for coordinates 0..2^bits of one axis.
 fn spread(bits: &[u32]) -> Vec<u32> {
-    (0..1u32 << bits.len())
-        .map(|c| {
-            bits.iter()
-                .enumerate()
-                .map(|(i, &to)| ((c >> i) & 1) << to)
-                .sum()
-        })
-        .collect()
+    if bits.windows(2).all(|w| w[0] < w[1]) {
+        let mask = axis_mask(bits);
+        let len = 1usize << bits.len();
+        let mut out = Vec::with_capacity(len);
+        let mut addr = 0u32;
+        for _ in 0..len {
+            out.push(addr);
+            addr = step_masked(addr, mask);
+        }
+        out
+    } else {
+        (0..1u32 << bits.len())
+            .map(|c| {
+                bits.iter()
+                    .enumerate()
+                    .map(|(i, &to)| ((c >> i) & 1) << to)
+                    .sum()
+            })
+            .collect()
+    }
 }
 
 /// Tables depend only on the micro-tile kind, block size and element size.
@@ -341,6 +413,7 @@ impl Layout {
             first_tail_mip: d.mips,
             mips,
             pattern: &EMPTY_PATTERN,
+            x_mask: 0,
         }
     }
 
@@ -502,15 +575,18 @@ impl Layout {
         let slice_size = slice_size * slab;
         let slices = slices / block[2];
         let addressable = !d.swizzle.xor() && d.samples == 1;
-        let pattern = if addressable {
+        let (pattern, x_mask) = if addressable {
             let kind = if thick {
                 2
             } else {
                 usize::from(d.swizzle.display())
             };
-            shared_pattern(kind, element_log2, block_log2)
+            (
+                shared_pattern(kind, element_log2, block_log2),
+                x_axis_mask(kind, element_log2, block_log2),
+            )
         } else {
-            &EMPTY_PATTERN
+            (&EMPTY_PATTERN, 0)
         };
         Layout {
             desc: d,
@@ -523,6 +599,7 @@ impl Layout {
             first_tail_mip,
             mips,
             pattern,
+            x_mask,
         }
     }
 
@@ -590,7 +667,7 @@ impl Layout {
         let bw = self.block[0];
         let x = x + m.tail.map_or(0, |t| t.x);
         (u64::from(x / bw) << self.alignment.trailing_zeros())
-            + u64::from(self.pattern[0][(x % bw) as usize])
+            + u64::from(deposit_bits(x % bw, self.x_mask))
     }
 
     /// Depth slices a subresource of mip `mip` covers: the mip's depth for
@@ -712,10 +789,20 @@ impl Layout {
         // the same contiguous runs repeat on every row, including mip tails.
         let mut runs = Vec::new();
         if !linear {
+            let bw = self.block[0];
+            let block_bytes = self.alignment as usize;
+            let x_start = m.tail.map_or(0, |t| t.x);
+            let mut tile_base =
+                (u64::from(x_start / bw) << self.alignment.trailing_zeros()) as usize;
+            let mut intra_x = deposit_bits(x_start % bw, self.x_mask);
             let mut first_linear = 0;
-            let mut first_tiled = self.column(m, 0) as usize;
+            let mut first_tiled = tile_base + intra_x as usize;
             for x in 1..m.width {
-                let offset = self.column(m, x) as usize;
+                intra_x = step_masked(intra_x, self.x_mask);
+                if intra_x == 0 {
+                    tile_base += block_bytes;
+                }
+                let offset = tile_base + intra_x as usize;
                 let at = x as usize * n;
                 if offset != first_tiled + (at - first_linear) {
                     runs.push((first_tiled, first_linear, at - first_linear));
@@ -1509,5 +1596,91 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    /// Reference bit-by-bit intra-tile coordinate scatter (independent of
+    /// `step_masked` and `deposit_bits`).
+    fn ref_scatter(bits: &[u32], coord: u32) -> u32 {
+        bits.iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, &to)| acc | (((coord >> i) & 1) << to))
+    }
+
+    /// Verifies 100% bit-exact equivalence between `step_masked` /
+    /// `deposit_bits` and the reference swizzle offset across every `(x, y)`
+    /// coordinate in a full 64 KiB tile for 8, 16, 32, 64, and 128 bpp.
+    #[test]
+    fn bm_swizzle_full_64kib_tile_matches_reference() {
+        for (swizzle, kind) in [(Swizzle::SW_64KB_S, 0usize), (Swizzle::SW_64KB_D, 1usize)] {
+            for element_log2 in 0..5u32 {
+                let bpe = 1u32 << element_log2;
+                let axes = pattern(kind, element_log2, 16);
+                let x_mask = axis_mask(&axes[0]);
+                let y_mask = axis_mask(&axes[1]);
+                assert_eq!(x_mask & y_mask, 0);
+
+                let bw = 1u32 << axes[0].len();
+                let bh = 1u32 << axes[1].len();
+                assert_eq!(bw * bh * bpe, 65536);
+
+                let layout = Layout::new(&desc(bw, bh, 1, bpe, swizzle)).unwrap();
+                assert_eq!(layout.block, [bw, bh, 1]);
+                assert_eq!(layout.x_mask, x_mask);
+
+                let y_monotonic = axes[1].windows(2).all(|w| w[0] < w[1]);
+                for y in 0..bh {
+                    let y_ref = ref_scatter(&axes[1], y);
+                    if y_monotonic {
+                        assert_eq!(deposit_bits(y, y_mask), y_ref);
+                    }
+                    let mut addr = y_ref;
+                    for x in 0..bw {
+                        let expected = y_ref | ref_scatter(&axes[0], x);
+                        assert_eq!(
+                            addr, expected,
+                            "step_masked mismatch: {swizzle:?} {bpe}B ({x},{y})"
+                        );
+                        assert_eq!(
+                            y_ref | deposit_bits(x, x_mask),
+                            expected,
+                            "deposit_bits mismatch: {swizzle:?} {bpe}B ({x},{y})"
+                        );
+                        assert_eq!(
+                            layout.offset(0, x, y, 0),
+                            Ok(u64::from(expected)),
+                            "Layout::offset mismatch: {swizzle:?} {bpe}B ({x},{y})"
+                        );
+                        addr = step_masked(addr, x_mask);
+                    }
+                    // Full scanline wrap restores `x = 0` while preserving `y_ref`.
+                    assert_eq!(addr, y_ref, "wrap mismatch: {swizzle:?} {bpe}B y={y}");
+                }
+            }
+        }
+    }
+
+    /// Edge-case verification for `step_masked` and `deposit_bits`: empty mask,
+    /// high-bit mask, sparse non-contiguous masks, and untouched non-mask bits.
+    #[test]
+    fn bm_swizzle_step_masked_and_deposit_bits_edge_cases() {
+        assert_eq!(step_masked(0xDEAD_BEEF, 0), 0xDEAD_BEEF);
+        assert_eq!(deposit_bits(0xFFFF_FFFF, 0), 0);
+
+        let high_mask = 1u32 << 31;
+        let payload = 0x5A5A_5A5A;
+        assert_eq!(step_masked(payload, high_mask), payload | high_mask);
+        assert_eq!(step_masked(payload | high_mask, high_mask), payload);
+        assert_eq!(deposit_bits(1, high_mask), high_mask);
+        assert_eq!(deposit_bits(0, high_mask), 0);
+
+        let mask = 0b1010_0101_0001_0010u32;
+        let fixed = 0xA5A5_0000u32 & !mask;
+        let count = 1u32 << mask.count_ones();
+        let mut addr = fixed;
+        for c in 0..count {
+            assert_eq!(addr, fixed | deposit_bits(c, mask));
+            addr = step_masked(addr, mask);
+        }
+        assert_eq!(addr, fixed);
     }
 }

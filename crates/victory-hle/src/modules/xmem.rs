@@ -554,44 +554,56 @@ fn shown_mut() -> RwLockWriteGuard<'static, Shown> {
 
 impl Shown {
     fn note(&mut self, base: usize, len: usize, slice: &Slice) {
+        let count = len / PAGE;
+        if count == 0 {
+            return;
+        }
         let section = Arc::as_ptr(&slice.section) as usize;
-        if len / PAGE > SHORT {
+        if count > SHORT {
             self.long.push((base, len, section, slice.index));
             return;
         }
-        for k in 0..len / PAGE {
+        for k in 0..count {
             self.pages.entry((section, slice.index + k)).or_default().push(base + k * PAGE);
         }
     }
 
     fn forget(&mut self, base: usize, len: usize, slice: &Slice) {
-        if len / PAGE > SHORT {
+        let count = len / PAGE;
+        if count == 0 {
+            return;
+        }
+        if count > SHORT {
             self.long.retain(|view| view.0 != base);
             return;
         }
         let section = Arc::as_ptr(&slice.section) as usize;
-        for k in 0..len / PAGE {
+        for k in 0..count {
             let key = (section, slice.index + k);
-            if let Some(at) = self.pages.get_mut(&key) {
-                at.retain(|&at| at != base + k * PAGE);
+            if let std::collections::hash_map::Entry::Occupied(mut entry) = self.pages.entry(key) {
+                let target = base + k * PAGE;
+                let at = entry.get_mut();
+                at.retain(|&addr| addr != target);
                 if at.is_empty() {
-                    self.pages.remove(&key);
+                    entry.remove();
                 }
             }
         }
     }
 
-    /// Where the title sees the page at `slice`: addresses and bytes.
-    fn at(&self, slice: &Slice) -> Vec<(usize, usize)> {
+    /// Visits every address where the title sees the page at `slice`.
+    fn for_each_at(&self, slice: &Slice, mut f: impl FnMut(usize)) {
         let section = Arc::as_ptr(&slice.section) as usize;
-        let mut out: Vec<(usize, usize)> =
-            self.pages.get(&(section, slice.index)).into_iter().flatten().map(|&at| (at, PAGE)).collect();
-        for &(base, len, of, index) in &self.long {
-            if of == section && (index..index + len / PAGE).contains(&slice.index) {
-                out.push((base + (slice.index - index) * PAGE, PAGE));
+        if let Some(addrs) = self.pages.get(&(section, slice.index)) {
+            for &at in addrs {
+                f(at);
             }
         }
-        out
+        for &(base, len, of, index) in &self.long {
+            if of == section && (index..index + len / PAGE).contains(&slice.index) {
+                f(base + (slice.index - index) * PAGE);
+            }
+        }
     }
 }
 
@@ -687,6 +699,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
+    table.pages.reserve(n);
     for index in 0..n {
         let slice = Slice {
             section: section.clone(),
@@ -714,11 +727,19 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     if pages.is_null() {
         return 0;
     }
+    if n == 0 {
+        return 1;
+    }
     // SAFETY: the title passes `n` page numbers.
     let numbers = unsafe { std::slice::from_raw_parts(pages, n) }.to_vec();
     let mut table = page_table_mut();
     // Dropped without the lock: the last page of a section unmaps its window.
-    let gone: Vec<Slice> = numbers.iter().filter_map(|number| table.pages.remove(number)).collect();
+    let mut gone = Vec::with_capacity(n);
+    for number in &numbers {
+        if let Some(slice) = table.pages.remove(number) {
+            gone.push(slice);
+        }
+    }
     drop(table);
     drop(gone);
     1
@@ -781,8 +802,11 @@ impl Drop for View {
 fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
     let end = offset.checked_add(len)?;
     let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
+    if pages.is_empty() {
+        return Some(Vec::new());
+    }
     let table = page_table();
-    let mut runs: Vec<(Slice, usize)> = Vec::new();
+    let mut runs: Vec<(Slice, usize)> = Vec::with_capacity(1);
     for page in pages {
         let Some(slice) = table.pages.get(page) else {
             tracing::warn!(page, offset, len, "a physical page the title does not own (any more)");
@@ -803,10 +827,17 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 
 /// Whether the title owns every page under bytes `[offset, offset + len)`.
 pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
+    let Some(end) = offset.checked_add(len) else {
+        return false;
+    };
+    let Some(pages) = pages.get(offset / PAGE..end.div_ceil(PAGE)) else {
+        return false;
+    };
+    if pages.is_empty() {
+        return true;
+    }
     let table = page_table();
-    pages
-        .get(offset / PAGE..(offset + len).div_ceil(PAGE))
-        .is_some_and(|pages| pages.iter().all(|page| table.pages.contains_key(page)))
+    pages.iter().all(|page| table.pages.contains_key(page))
 }
 
 /// Where the title sees the pages under bytes `[offset, offset + len)` now,
@@ -814,12 +845,29 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
 /// wrote them).
 pub(crate) fn pages_shown(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
     let numbers = pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or_default();
+    if numbers.is_empty() {
+        return Vec::new();
+    }
     let slices: Vec<Slice> = {
         let table = page_table();
-        numbers.iter().filter_map(|n| table.pages.get(n)).cloned().collect()
+        let mut out = Vec::with_capacity(numbers.len());
+        for n in numbers {
+            if let Some(slice) = table.pages.get(n) {
+                out.push(slice.clone());
+            }
+        }
+        out
     };
-    let shown = SHOWN.read().unwrap_or_else(|e| e.into_inner());
-    let mut at: Vec<(usize, usize)> = slices.iter().flat_map(|slice| shown.at(slice)).collect();
+    if slices.is_empty() {
+        return Vec::new();
+    }
+    let mut at = Vec::with_capacity(slices.len());
+    {
+        let shown = SHOWN.read().unwrap_or_else(|e| e.into_inner());
+        for slice in &slices {
+            shown.for_each_at(slice, |addr| at.push((addr, PAGE)));
+        }
+    }
     at.sort_unstable();
     at
 }
@@ -885,13 +933,14 @@ impl PageWindow {
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
-    let runs = runs(pages, offset, len)?;
-    let [(slice, n)] = runs.as_slice() else {
+    let mut runs = runs(pages, offset, len)?;
+    if runs.len() != 1 {
         return None;
-    };
-    let view = match slice.section.window(slice.index, *n) {
-        Some(at) => Window::Kept(at, slice.section.clone()),
-        None => Window::Own(View::map(slice, *n)?),
+    }
+    let (slice, n) = runs.pop()?;
+    let view = match slice.section.window(slice.index, n) {
+        Some(at) => Window::Kept(at, slice.section),
+        None => Window::Own(View::map(&slice, n)?),
     };
     Some(PageWindow {
         view,
@@ -915,11 +964,14 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
     let Some(touched) = pages.get(first..end.div_ceil(PAGE)) else {
         return Vec::new();
     };
+    if touched.is_empty() {
+        return Vec::new();
+    }
     let slices: Vec<Option<Slice>> = {
         let table = page_table();
         touched.iter().map(|page| table.pages.get(page).cloned()).collect()
     };
-    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    let mut pieces: Vec<(usize, usize)> = Vec::with_capacity(slices.len());
     {
         let shown = SHOWN.read().unwrap_or_else(|e| e.into_inner());
         for (i, slice) in slices.iter().enumerate() {
@@ -927,18 +979,27 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
             // The bytes of this page that the write covers.
             let lo = if i == 0 { offset % PAGE } else { 0 };
             let hi = (end - (first + i) * PAGE).min(PAGE);
-            pieces.extend(shown.at(slice).into_iter().map(|(at, _)| (at + lo, hi - lo)));
+            let bytes = hi - lo;
+            shown.for_each_at(slice, |at| pieces.push((at + lo, bytes)));
         }
+    }
+    if pieces.len() <= 1 {
+        return pieces;
     }
     pieces.sort_unstable();
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    for (at, bytes) in pieces {
-        match runs.last_mut() {
-            Some((start, n)) if *start + *n == at => *n += bytes,
-            _ => runs.push((at, bytes)),
+    let mut write = 0;
+    for read in 1..pieces.len() {
+        let (at, bytes) = pieces[read];
+        let (start, n) = &mut pieces[write];
+        if *start + *n == at {
+            *n += bytes;
+        } else {
+            write += 1;
+            pieces[write] = (at, bytes);
         }
     }
-    runs
+    pieces.truncate(write + 1);
+    pieces
 }
 
 /// DirectStorage has put bytes `[offset, offset + len)` of `pages` into
@@ -973,13 +1034,15 @@ pub(crate) fn map_costs() -> Option<String> {
     let n: [u64; 15] = std::array::from_fn(|i| MAPPING[i].swap(0, Ordering::Relaxed));
     let time = |i: usize| matches!(i, 2 | 3 | 4 | 6 | 8 | 10 | 12 | 14);
     (n[0] + n[5] > 0).then(|| {
-        let all: Vec<String> = n
-            .iter()
-            .enumerate()
-            .map(|(i, &n)| if time(i) { n / 1_000_000 } else { n })
-            .map(|n| n.to_string())
-            .collect();
-        all.join("\t")
+        use std::fmt::Write;
+        let mut out = String::with_capacity(64);
+        for (i, &val) in n.iter().enumerate() {
+            if i > 0 {
+                out.push('\t');
+            }
+            let _ = write!(out, "{}", if time(i) { val / 1_000_000 } else { val });
+        }
+        out
     })
 }
 
@@ -1083,6 +1146,9 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    if n == 0 {
+        return address;
+    }
     let base = address as usize;
     // Read before any lock is taken: a fault in title memory may wait for
     // the mapping call that holds them.
@@ -1104,13 +1170,13 @@ pub extern "system" fn XMemMapPhysicalPages(
     let Some(pages) = pages else {
         return address;
     };
-    let slices: Vec<Option<Slice>> = {
+    let mut slices: Vec<Option<Slice>> = {
         let table = page_table();
         pages.iter().map(|page| table.pages.get(page).cloned()).collect()
     };
     let mut i = 0;
     while i < n {
-        let Some(first) = slices[i].clone() else {
+        let Some(first) = slices[i].take() else {
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
             return std::ptr::null_mut();
         };
@@ -1141,6 +1207,9 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 ) -> BOOL {
     if addresses.is_null() {
         return 0;
+    }
+    if n == 0 {
+        return 1;
     }
     lift_thread();
     if side_by_side() > 1 && n > 1 {
@@ -1179,22 +1248,24 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    if len == 0 {
+        return true;
+    }
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let at = from + k;
-        let Some(slice) = physical.slice_at(at) else {
-            return false;
-        };
-        if !map(&mut physical, to + k, PAGE, slice) {
-            return false;
+    if from != 0 {
+        for k in (0..len).step_by(PAGE) {
+            let at = from + k;
+            let Some(slice) = physical.slice_at(at) else {
+                return false;
+            };
+            if !map(&mut physical, to + k, PAGE, slice) {
+                return false;
+            }
         }
     }
     true
@@ -1202,28 +1273,36 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 
 /// [`map_alias`] of many ranges, in order.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
+    if ranges.is_empty() {
+        return true;
+    }
     let _costed = Costed::begin(None);
     lift_thread();
     if side_by_side() <= 1 {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
     }
     // By the page: the address, and the one whose page it is to show.
-    let pages: Vec<(usize, Option<usize>)> = ranges
-        .iter()
-        .flat_map(|&(to, from, len)| {
-            (0..len as usize).step_by(PAGE).map(move |k| (to as usize + k, (from != 0).then_some(from as usize + k)))
-        })
-        .collect();
+    let total_pages: usize = ranges.iter().map(|&(_, _, len)| (len as usize).div_ceil(PAGE)).sum();
+    if total_pages == 0 {
+        return true;
+    }
+    let mut pages: Vec<(usize, Option<usize>)> = Vec::with_capacity(total_pages);
+    for &(to, from, len) in ranges {
+        for k in (0..len as usize).step_by(PAGE) {
+            pages.push((to as usize + k, (from != 0).then_some(from as usize + k)));
+        }
+    }
     if pages.iter().any(|p| p.0 % PAGE != 0 || p.1.is_some_and(|from| from % PAGE != 0)) {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
     }
     let mut ok = true;
     let mut at = 0;
+    let mut touched = std::collections::HashSet::with_capacity(pages.len().min(GROUP));
     while at < pages.len() {
         let _busy = Busy::begin();
+        let mut ops: Vec<Op> = Vec::with_capacity((pages.len() - at).min(GROUP));
+        touched.clear();
         let mut physical = physical();
-        let mut ops: Vec<Op> = Vec::new();
-        let mut touched = std::collections::HashSet::new();
         for &(to, from) in &pages[at..] {
             // A page the group changes already, or one it would be mapped
             // from: after it.
@@ -1245,28 +1324,37 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
 /// Maps (page number not 0) or unmaps each address; false if a page is not
 /// the title's or the host refuses one.
 fn scatter(wanted: &[(usize, usize)]) -> bool {
+    if wanted.is_empty() {
+        return true;
+    }
     let mut ok = true;
     let mut at = 0;
+    let mut touched = std::collections::HashSet::with_capacity(wanted.len().min(GROUP));
     while at < wanted.len() {
         let _busy = Busy::begin();
         let mut costed = Costed::begin(None);
-        let mut ops: Vec<Op> = Vec::new();
+        let mut ops: Vec<Op> = Vec::with_capacity((wanted.len() - at).min(GROUP));
+        touched.clear();
         let mut physical = physical();
         if let Some(costed) = &mut costed {
             costed.waited = costed.started.elapsed().as_nanos() as u64;
         }
         {
             let table = page_table();
-            let mut touched = std::collections::HashSet::new();
             for &(to, page) in &wanted[at..] {
                 if ops.len() == GROUP || !touched.insert(to) {
                     break;
                 }
-                let slice = table.pages.get(&page).cloned();
-                if page != 0 && slice.is_none() {
-                    tracing::warn!(page, "XMemMapPhysicalPagesScatter: unknown page");
-                    ok = false;
-                }
+                let slice = if page == 0 {
+                    None
+                } else {
+                    let s = table.pages.get(&page).cloned();
+                    if s.is_none() {
+                        tracing::warn!(page, "XMemMapPhysicalPagesScatter: unknown page");
+                        ok = false;
+                    }
+                    s
+                };
                 ops.push(Op::new(to, slice));
                 at += 1;
             }
@@ -1421,6 +1509,9 @@ impl Op {
 /// With [`PHYSICAL`] and the change of mapping (`title_memory_remapping`)
 /// held.
 fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
+    if ops.is_empty() {
+        return true;
+    }
     for op in &mut ops {
         let there = physical
             .views
@@ -1584,14 +1675,21 @@ mod pool {
         }
         drop(over);
         // No worker changes it any more (one may still hold it for a moment).
-        batch
-            .ops
-            .iter()
-            .map(|(op, done)| {
-                let op = Op { at: op.at, slice: op.slice.clone(), had: op.had, own: op.own };
-                (op, done.load(Ordering::Acquire))
-            })
-            .collect()
+        match Arc::try_unwrap(batch) {
+            Ok(batch) => batch
+                .ops
+                .into_iter()
+                .map(|(op, done)| (op, done.into_inner()))
+                .collect(),
+            Err(batch) => batch
+                .ops
+                .iter()
+                .map(|(op, done)| {
+                    let op = Op { at: op.at, slice: op.slice.clone(), had: op.had, own: op.own };
+                    (op, done.load(Ordering::Acquire))
+                })
+                .collect(),
+        }
     }
 }
 

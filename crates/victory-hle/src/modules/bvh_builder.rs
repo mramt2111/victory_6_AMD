@@ -17,19 +17,41 @@ use std::sync::OnceLock;
 use victory_gpu::dxr::{
     self, GuestBatchedDesc2, GuestBuildAsDesc, GuestBuildAsInputs, GuestPrebuildInfo, GuestStreamDesc,
 };
-use victory_loader::{LoadedImage, UnimplementedPolicy};
+use victory_loader::{LoadedImage, MissingImport, UnimplementedPolicy};
 use windows_sys::Win32::Foundation::HMODULE;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryA};
 
 use crate::{HleExport, HleModule, HleResolver};
 
 const SYM_CTOR: &str = "??0XboxBvhBuilder@@QEAA@PEAUID3D12Device11@@_N@Z";
-const SYM_DTOR: &str = "??1XboxBvhBuilder@@QEAA@XZ";
+const SYM_DTOR: &str = "??1XboxBvhBuilder@@XZ";
 const SYM_BUILD_BATCHED_2X: &str = "?BuildRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList6@@IPEBUD3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2@@@Z";
 const SYM_COPY: &str = "?CopyRaytracingAccelerationStructure@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList4@@_K1W4D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE@@@Z";
 const SYM_PREBUILD: &str = "?GetRaytracingAccelerationStructurePrebuildInfo@XboxBvhBuilder@@QEAAXPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS@@PEBUD3D12XBOX_XDXR_STREAM_DESC@@PEAUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO@@@Z";
 const SYM_REHYDRATE_BATCHED_2X: &str = "?RehydrateRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAJPEAUID3D12GraphicsCommandList8@@IPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@PEB_K@Z";
 const SYM_SET_64BIT_MORTON: &str = "?Set64BitMortonCodes@XboxBvhBuilder@@QEAAX_N@Z";
+
+/// Telemetry, ETW, and debug-marker imports that are safe to leave as
+/// zero-returning stubs when binding `XboxBvhBuilder.dll`.
+const BENIGN_IMPORT_SYMBOLS: &[&str] = &[
+    "EventRegister",
+    "EventUnregister",
+    "EventWrite",
+    "EventWriteTransfer",
+    "EventSetInformation",
+    "TraceMessage",
+    "TraceMessageVa",
+    "EtwEventRegister",
+    "EtwEventUnregister",
+    "EtwEventWrite",
+    "EtwEventWriteTransfer",
+    "OutputDebugStringA",
+    "OutputDebugStringW",
+    "IsDebuggerPresent",
+    "PIXBeginEvent",
+    "PIXEndEvent",
+    "PIXSetMarker",
+];
 
 type FnCtor = unsafe extern "system" fn(*mut c_void, *mut c_void, u8) -> *mut c_void;
 type FnDtor = unsafe extern "system" fn(*mut c_void);
@@ -56,6 +78,38 @@ struct RealExports {
 // SAFETY: function pointers into a permanently mapped module image.
 unsafe impl Send for RealExports {}
 unsafe impl Sync for RealExports {}
+
+enum ConsoleDllLoad {
+    Loaded(LoadedImage),
+    /// One or more mandatory imports were unresolved; disable software BVH
+    /// rather than running with zero-returning stubs or falling back.
+    MandatoryImportsMissing,
+    Failed,
+}
+
+fn is_benign_import(import: &MissingImport) -> bool {
+    BENIGN_IMPORT_SYMBOLS
+        .iter()
+        .any(|benign| import.symbol.eq_ignore_ascii_case(benign))
+}
+
+/// Validates that no mandatory (non-benign) imports remained unresolved after
+/// binding `XboxBvhBuilder.dll`.
+///
+/// Returns `Ok(())` if all unresolved entries are known-benign telemetry or
+/// debug symbols, or `Err(missing)` listing each offending `"DLL!symbol"`.
+fn check_mandatory_imports(unimplemented: &[MissingImport]) -> Result<(), Vec<String>> {
+    let missing_mandatory: Vec<String> = unimplemented
+        .iter()
+        .filter(|imp| !is_benign_import(imp))
+        .map(|imp| format!("{}!{}", imp.dll, imp.symbol))
+        .collect();
+    if missing_mandatory.is_empty() {
+        Ok(())
+    } else {
+        Err(missing_mandatory)
+    }
+}
 
 fn real_exports() -> Option<&'static RealExports> {
     static REAL: OnceLock<Option<RealExports>> = OnceLock::new();
@@ -90,14 +144,21 @@ fn resolve_real_dll() -> Option<RealExports> {
     let dll_path = find_title_bvh_dll()?;
 
     // 3. Prepare, map, bind console imports, and attach via `victory-loader`.
-    if let Some(image) = load_console_dll(&dll_path) {
-        let module = image.base() as HMODULE;
-        tracing::info!(
-            base = format_args!("{:#x}", image.base()),
-            path = %dll_path.display(),
-            "bvh_builder: mapped real XboxBvhBuilder.dll via victory-loader"
-        );
-        return Some(exports_from_module(module, Some(image)));
+    match load_console_dll(&dll_path) {
+        ConsoleDllLoad::Loaded(image) => {
+            let module = image.base() as HMODULE;
+            tracing::info!(
+                base = format_args!("{:#x}", image.base()),
+                path = %dll_path.display(),
+                "bvh_builder: mapped real XboxBvhBuilder.dll via victory-loader"
+            );
+            return Some(exports_from_module(module, Some(image)));
+        }
+        ConsoleDllLoad::MandatoryImportsMissing => {
+            // Do not fall back to LoadLibraryA; keep software BVH disabled.
+            return None;
+        }
+        ConsoleDllLoad::Failed => {}
     }
 
     // 4. Fallback: plain Windows `LoadLibraryA` for non-console/host-linked copies.
@@ -136,29 +197,46 @@ fn find_title_bvh_dll() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
-fn load_console_dll(path: &Path) -> Option<LoadedImage> {
-    let original = std::fs::read(path)
+fn load_console_dll(path: &Path) -> ConsoleDllLoad {
+    let Ok(original) = std::fs::read(path)
         .inspect_err(|e| tracing::warn!(error = %e, path = %path.display(), "bvh_builder: failed reading DLL"))
-        .ok()?;
-    let prepared = victory_loader::prepare(&original)
+    else {
+        return ConsoleDllLoad::Failed;
+    };
+    let Ok(prepared) = victory_loader::prepare(&original)
         .inspect_err(|e| tracing::warn!(error = %e, path = %path.display(), "bvh_builder: failed preparing DLL"))
-        .ok()?;
+    else {
+        return ConsoleDllLoad::Failed;
+    };
     let title = crate::runtime::title();
     let cache_dir = if !title.storage.as_os_str().is_empty() {
         title.storage.with_file_name("bvh-builder-cache")
     } else {
         std::env::temp_dir().join("victory-bvh-builder-cache")
     };
-    let image = victory_loader::load(&prepared, &cache_dir)
+    let Ok(image) = victory_loader::load(&prepared, &cache_dir)
         .inspect_err(|e| tracing::warn!(error = %e, path = %path.display(), "bvh_builder: failed mapping DLL"))
-        .ok()?;
+    else {
+        return ConsoleDllLoad::Failed;
+    };
     let resolver = HleResolver::default();
     match image.bind_imports(&resolver, UnimplementedPolicy::ReturnZero) {
         Ok(report) => {
+            if let Err(missing_mandatory) = check_mandatory_imports(&report.missing) {
+                tracing::error!(
+                    missing_count = missing_mandatory.len(),
+                    missing = %missing_mandatory.join(", "),
+                    path = %path.display(),
+                    "bvh_builder: real XboxBvhBuilder.dll has unresolved mandatory imports; unloading image and disabling software BVH"
+                );
+                // SAFETY: newly mapped here, never published or attached.
+                unsafe { image.unload() };
+                return ConsoleDllLoad::MandatoryImportsMissing;
+            }
             if !report.missing.is_empty() {
                 tracing::warn!(
                     missing = report.missing.len(),
-                    "bvh_builder: real XboxBvhBuilder.dll had unresolved imports"
+                    "bvh_builder: real XboxBvhBuilder.dll had unresolved benign imports"
                 );
             }
         }
@@ -166,7 +244,7 @@ fn load_console_dll(path: &Path) -> Option<LoadedImage> {
             tracing::warn!(error = %e, "bvh_builder: failed binding real XboxBvhBuilder.dll imports");
             // SAFETY: newly mapped here, never published or attached.
             unsafe { image.unload() };
-            return None;
+            return ConsoleDllLoad::Failed;
         }
     }
     crate::runtime::set_image_path(image.base(), path);
@@ -177,9 +255,9 @@ fn load_console_dll(path: &Path) -> Option<LoadedImage> {
         unsafe { image.detach() };
         crate::runtime::forget_image(image.base());
         unsafe { image.unload() };
-        return None;
+        return ConsoleDllLoad::Failed;
     }
-    Some(image)
+    ConsoleDllLoad::Loaded(image)
 }
 
 fn exports_from_module(module: HMODULE, image: Option<LoadedImage>) -> RealExports {
@@ -341,5 +419,46 @@ pub(crate) fn module() -> HleModule {
                 address: set_64bit_morton_codes as *const () as usize,
             },
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn missing(dll: &str, symbol: &str) -> MissingImport {
+        MissingImport {
+            dll: dll.to_owned(),
+            symbol: symbol.to_owned(),
+        }
+    }
+
+    #[test]
+    fn mandatory_imports_pass_when_empty_or_benign_only() {
+        assert_eq!(check_mandatory_imports(&[]), Ok(()));
+        let benign = [
+            missing("advapi32.dll", "EventRegister"),
+            missing("kernel32.dll", "OutputDebugStringW"),
+            missing("pix.dll", "pixbeginevent"),
+        ];
+        assert_eq!(check_mandatory_imports(&benign), Ok(()));
+    }
+
+    #[test]
+    fn partially_resolved_mandatory_imports_fail_cleanly() {
+        let partial = [
+            missing("advapi32.dll", "EventWrite"),
+            missing("d3d12_x.dll", "D3D12CreateDevice"),
+            missing("kernelx.dll", "VirtualAlloc"),
+            missing("kernel32.dll", "IsDebuggerPresent"),
+        ];
+        let err = check_mandatory_imports(&partial).unwrap_err();
+        assert_eq!(
+            err,
+            vec![
+                "d3d12_x.dll!D3D12CreateDevice".to_owned(),
+                "kernelx.dll!VirtualAlloc".to_owned(),
+            ]
+        );
     }
 }

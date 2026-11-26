@@ -19,7 +19,8 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use super::xasync::E_INVALIDARG;
@@ -55,12 +56,20 @@ struct Heap {
     created: bool,
 }
 
-static HEAP: Mutex<Heap> = Mutex::new(Heap {
+static HEAP: RwLock<Heap> = RwLock::new(Heap {
     blocks: BTreeMap::new(),
     by_apu: BTreeMap::new(),
     free: BTreeMap::new(),
     created: false,
 });
+
+fn read_heap() -> RwLockReadGuard<'static, Heap> {
+    HEAP.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write_heap() -> RwLockWriteGuard<'static, Heap> {
+    HEAP.write().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Device addresses start above 0, which means "none" to titles.
 const APU_BASE: u32 = 0x0001_0000;
@@ -86,15 +95,15 @@ impl Heap {
         Some(apu)
     }
 
-    fn give_back(&mut self, mut start: u32, mut end: u32) {
-        if let Some((&before, &before_end)) = self.free.range(..start).next_back()
-            && before_end == start
-        {
-            self.free.remove(&before);
-            start = before;
-        }
+    fn give_back(&mut self, start: u32, mut end: u32) {
         if let Some(after_end) = self.free.remove(&end) {
             end = after_end;
+        }
+        if let Some((_, before_end)) = self.free.range_mut(..start).next_back()
+            && *before_end == start
+        {
+            *before_end = end;
+            return;
         }
         self.free.insert(start, end);
     }
@@ -103,17 +112,24 @@ impl Heap {
 /// Zeroed host memory and its device address.
 fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
     let layout = Layout::from_size_align(size.max(1), align.max(16)).ok()?;
-    let mut heap = lock(&HEAP);
-    let apu = heap.take(u32::try_from(layout.size()).ok()?, align as u32)?;
+    let apu_size = u32::try_from(layout.size()).ok()?;
+    let apu_align = u32::try_from(align).ok()?;
     // SAFETY: non-zero size.
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     if ptr.is_null() {
-        heap.give_back(apu, apu + layout.size() as u32);
         return None;
     }
+    let mut heap = write_heap();
+    let Some(apu) = heap.take(apu_size, apu_align) else {
+        drop(heap);
+        // SAFETY: just allocated with `layout`.
+        unsafe { std::alloc::dealloc(ptr, layout) };
+        return None;
+    };
     heap.blocks
         .insert(ptr as usize, Block { size, apu, layout });
     heap.by_apu.insert(apu, ptr as usize);
+    drop(heap);
     // The big ones are named in the log: they are the title's audio memory
     // given out of our allocator, which the memory line counts as ours.
     if size >= 32 << 20 {
@@ -123,7 +139,10 @@ fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
 }
 
 fn heap_free(ptr: *mut u8) {
-    let mut heap = lock(&HEAP);
+    if ptr.is_null() {
+        return;
+    }
+    let mut heap = write_heap();
     let Some(block) = heap.blocks.remove(&(ptr as usize)) else {
         return;
     };
@@ -144,7 +163,7 @@ pub extern "system" fn ApuCreateHeap(cached: u32, _non_cached: u32) -> HRESULT {
     if cached == 0 {
         return E_INVALIDARG;
     }
-    let mut heap = lock(&HEAP);
+    let mut heap = write_heap();
     if heap.created {
         return ALREADY_ALLOCATED;
     }
@@ -160,7 +179,10 @@ pub extern "system" fn ApuMapApuAddress(apu: u32) -> *mut c_void {
 
 /// The device address of any byte of a heap block, 0 elsewhere.
 fn heap_map(ptr: usize) -> u32 {
-    let heap = lock(&HEAP);
+    if ptr == 0 {
+        return 0;
+    }
+    let heap = read_heap();
     match heap.blocks.range(..=ptr).next_back() {
         Some((&start, block)) if ptr < start + block.size.max(1) => {
             block.apu + (ptr - start) as u32
@@ -171,7 +193,10 @@ fn heap_map(ptr: usize) -> u32 {
 
 /// The host address of a device address, if a heap block holds it.
 fn heap_unmap(apu: u32) -> Option<*mut u8> {
-    let heap = lock(&HEAP);
+    if apu < APU_BASE {
+        return None;
+    }
+    let heap = read_heap();
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
     let block = &heap.blocks[&host];
     (apu < start.saturating_add(block.size.max(1) as u32))
@@ -180,34 +205,38 @@ fn heap_unmap(apu: u32) -> Option<*mut u8> {
 
 /// Host pointer to `[apu, apu + len)` if one live heap block holds them all.
 fn heap_range(heap: &Heap, apu: u32, len: usize) -> Option<*mut u8> {
+    if apu < APU_BASE {
+        return None;
+    }
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
     let offset = (apu - start) as usize;
     let end = offset.checked_add(len)?;
     (end <= heap.blocks[&host].size).then_some((host + offset) as *mut u8)
 }
 
-/// Copies `len` bytes of title memory at a device address while holding `HEAP`.
-fn heap_read(apu: u32, len: usize) -> Option<Vec<u8>> {
-    let heap = lock(&HEAP);
+/// Borrows `[apu, apu + len)` directly from title memory under a shared `HEAP`
+/// read lock, avoiding a full-buffer heap allocation and copy per XMA frame.
+fn heap_with_slice<R>(apu: u32, len: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    let heap = read_heap();
     let src = heap_range(&heap, apu, len)?;
-    let mut out = vec![0u8; len];
     // SAFETY: `heap_range` verified `[src, src + len)` lies inside a live heap
-    // block, and holding `HEAP` prevents `ApuFree` from freeing it during the copy.
-    unsafe { std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len) };
-    Some(out)
+    // block, and holding a `HEAP` read lock prevents `ApuFree` from freeing it.
+    let slice = unsafe { std::slice::from_raw_parts(src, len) };
+    Some(f(slice))
 }
 
 /// Writes `N` bytes produced by `fill` to title memory at a device address while
-/// holding `HEAP`. Returns `false` without calling `fill` if out of bounds.
+/// holding a shared `HEAP` read lock. Returns `false` without calling `fill` if
+/// out of bounds.
 fn heap_write_with<const N: usize>(apu: u32, fill: impl FnOnce(&mut [u8; N])) -> bool {
-    let heap = lock(&HEAP);
+    let heap = read_heap();
     let Some(dst) = heap_range(&heap, apu, N) else {
         return false;
     };
     let mut buf = [0u8; N];
     fill(&mut buf);
     // SAFETY: `heap_range` verified `[dst, dst + N)` lies inside a live heap
-    // block, and holding `HEAP` prevents `ApuFree` from freeing it during the copy.
+    // block, and holding a `HEAP` read lock prevents `ApuFree` from freeing it.
     unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, N) };
     true
 }
@@ -296,6 +325,9 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
     let mut xma = XMA.write().unwrap_or_else(|e| e.into_inner());
     xma.array = arrays[4] as usize;
     xma.voices = (0..counts[4]).map(|_| Mutex::new(None)).collect();
+    xma.active_words = (0..(counts[4] as usize).div_ceil(64))
+        .map(|_| AtomicU64::new(0))
+        .collect();
     S_OK
 }
 
@@ -348,6 +380,8 @@ const INPUT_INVALID: u32 = 4;
 struct Voice {
     decoder: Option<xma::Decoder>,
     pcm: VecDeque<i16>,
+    /// Reusable per-frame decode/flush buffer to avoid per-frame allocations.
+    scratch_pcm: Vec<i16>,
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
     ended: bool,
@@ -379,12 +413,16 @@ struct Xma {
     /// so a command for one voice never waits for others to decode (the
     /// title sends them from its time-critical mixer thread).
     voices: Vec<Mutex<Option<Voice>>>,
+    /// Bitset of enabled voices (64 per word), updated under each voice's lock
+    /// so `pump()` skips idle slots without locking every mutex.
+    active_words: Vec<AtomicU64>,
 }
 
 impl Xma {
     const EMPTY: Xma = Xma {
         array: 0,
         voices: Vec::new(),
+        active_words: Vec::new(),
     };
 }
 
@@ -432,8 +470,14 @@ impl Xma {
     }
 
     fn enable(&self, index: u32) {
+        if self.enable_no_wake(index) {
+            wake_decoder();
+        }
+    }
+
+    fn enable_no_wake(&self, index: u32) -> bool {
         let Some(context) = self.context(index) else {
-            return;
+            return false;
         };
         let mut slot = lock(&self.voices[index as usize]);
         context.set_field(2, 26, 6, 0);
@@ -446,7 +490,8 @@ impl Xma {
         dump_input(index, context);
         *slot = Some(Voice {
             decoder: None,
-            pcm: VecDeque::new(),
+            pcm: VecDeque::with_capacity(xma::FRAME_SAMPLES * 2),
+            scratch_pcm: Vec::with_capacity(xma::FRAME_SAMPLES * 2),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
             trace: Trace {
@@ -461,15 +506,25 @@ impl Xma {
                 ended_ms: None,
             },
         });
-        drop(slot);
-        wake_decoder();
+        let idx = index as usize;
+        self.active_words[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
+        true
     }
 
     fn disable(&self, index: u32) {
         let Some(context) = self.context(index) else {
             return;
         };
-        let Some(voice) = lock(&self.voices[index as usize]).take() else {
+        let voice = {
+            let mut slot = lock(&self.voices[index as usize]);
+            let voice = slot.take();
+            if voice.is_some() {
+                let idx = index as usize;
+                self.active_words[idx / 64].fetch_and(!(1u64 << (idx % 64)), Ordering::Release);
+            }
+            voice
+        };
+        let Some(voice) = voice else {
             return;
         };
         let t = &voice.trace;
@@ -511,19 +566,30 @@ impl Xma {
             t.partial_takes += u32::from(blocks < size);
         }
         drop(slot);
-        wake_decoder();
+        if blocks > 0 {
+            wake_decoder();
+        }
     }
 
     /// Fills every enabled context's output as far as it has room.
     fn pump(&self) {
+        if self.array == 0 || self.voices.is_empty() {
+            return;
+        }
         let start = Instant::now();
         let mut active = 0;
-        for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
-                pump(context, voice);
-                active += 1;
+        for (word_idx, word) in self.active_words.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                let index = (word_idx * 64 + bit as usize) as u32;
+                if let (Some(context), Some(voice)) =
+                    (self.context(index), &mut *lock(&self.voices[index as usize]))
+                {
+                    pump(context, voice);
+                    active += 1;
+                }
             }
         }
         let took = start.elapsed();
@@ -538,6 +604,7 @@ fn pump(context: Context, voice: &mut Voice) {
     if size == 0 {
         return;
     }
+    let samples_per_block_per_ch = SAMPLES_PER_BLOCK / context.channels();
     while context.field(1, 31, 1) == 1 {
         // A skipped frame or an input boundary can advance the decoder without
         // producing samples. Publish only complete blocks, except the final
@@ -557,17 +624,23 @@ fn pump(context: Context, voice: &mut Voice) {
         let Some(address) = context.get(7).checked_add(write * BLOCK_BYTES as u32) else {
             return;
         };
+        let mut peak = voice.trace.peak;
         let wrote = heap_write_with::<BLOCK_BYTES>(address, |out| {
-            for pair in out.as_chunks_mut::<2>().0 {
-                let sample = voice.pcm.pop_front().unwrap_or(0);
-                voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
-                pair.copy_from_slice(&sample.to_le_bytes());
+            let chunks = out.as_chunks_mut::<2>().0;
+            let available = voice.pcm.len().min(SAMPLES_PER_BLOCK);
+            for (pair, sample) in chunks[..available]
+                .iter_mut()
+                .zip(voice.pcm.drain(..available))
+            {
+                peak = peak.max(sample.saturating_abs());
+                *pair = sample.to_le_bytes();
             }
         });
         if !wrote {
             return;
         }
-        voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
+        voice.trace.peak = peak;
+        voice.trace.produced += samples_per_block_per_ch;
         let write = (write + 1) % size;
         context.set_field(0, 27, 5, write);
         // The read block is the title's: taken modulo the ring like the
@@ -603,9 +676,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
             if let Some(decoder) = &mut voice.decoder {
-                let mut tail = Vec::new();
-                decoder.flush(&mut tail);
-                voice.pcm.extend(tail);
+                voice.scratch_pcm.clear();
+                decoder.flush(&mut voice.scratch_pcm);
+                voice.pcm.extend(&voice.scratch_pcm);
             }
             voice.ended = true;
             voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
@@ -621,16 +694,23 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         0 => (context.get(5), context.field(0, 0, 12)),
         _ => (context.get(6), context.field(1, 0, 12)),
     };
-    let Some(data) = heap_read(address & !0x7ff, packets as usize * xma::PACKET_BYTES) else {
+    if packets == 0 {
         context.set_field(0, 20 + current, 1, 0);
         return true;
-    };
-    let mut at = context.field(2, 0, 26) as usize;
-    if at < 32 {
-        at = 32 + xma::packet(&data, 0).map_or(0, |p| p.first_frame_bit as usize);
     }
-    let Some(frame) = xma::read_frame(&data, at) else {
-        // This input is used up.
+    let mut at = context.field(2, 0, 26) as usize;
+    let Some(frame) = heap_with_slice(
+        address & !0x7ff,
+        packets as usize * xma::PACKET_BYTES,
+        |data| {
+            if at < 32 {
+                at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
+            }
+            xma::read_frame(data, at)
+        },
+    )
+    .flatten() else {
+        // Out of bounds or this input is used up.
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
@@ -638,9 +718,10 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
         xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
     });
-    let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
+    voice.scratch_pcm.clear();
+    voice.scratch_pcm.reserve(xma::FRAME_SAMPLES * channels);
     voice.trace.frames += 1;
-    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
+    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut voice.scratch_pcm) {
         voice.trace.bad_frames += 1;
         if voice.trace.bad_frames <= 2 {
             tracing::debug!(
@@ -661,7 +742,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let looping = loops > 0 && ends_loop;
     if looping {
         let keep = (context.field(1, 12, 2) as usize + 1) * xma::SUBFRAME_SAMPLES * channels;
-        pcm.truncate(keep);
+        voice.scratch_pcm.truncate(keep);
         next = context.field(3, 0, 26) as usize;
         if loops != 255 {
             context.set_field(0, 12, 8, loops - 1);
@@ -669,9 +750,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     }
     // What is still to skip is this frame's (the stream's first, or a
     // loop's first when it is its last too).
-    let skip = (voice.skip * channels).min(pcm.len());
+    let skip = (voice.skip * channels).min(voice.scratch_pcm.len());
     voice.skip -= skip / channels;
-    voice.pcm.extend(&pcm[skip..]);
+    voice.pcm.extend(&voice.scratch_pcm[skip..]);
     if looping {
         // The loop's own skip is of its first frame, decoded next: not of
         // this one, its last.
@@ -699,9 +780,10 @@ fn dump_input(index: u32, context: Context) {
     }
     let dir = std::path::PathBuf::from(dir);
     let words: Vec<u8> = (0..16).flat_map(|w| context.get(w).to_le_bytes()).collect();
-    let input = heap_read(
+    let input = heap_with_slice(
         context.get(5) & !0x7ff,
         context.field(0, 0, 12) as usize * xma::PACKET_BYTES,
+        |s| s.to_vec(),
     );
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.ctx")), words);
@@ -735,13 +817,30 @@ fn xma_command(command: u32, word: impl Fn(usize) -> Option<u32>) -> bool {
         ENABLE_XMA => xma.enable(word(0).unwrap_or(u32::MAX)),
         DISABLE_XMA => xma.disable(word(0).unwrap_or(u32::MAX)),
         ENABLE_XMAS | DISABLE_XMAS => {
-            for i in 0..xma.voices.len() as u32 {
-                if word(i as usize / 32).unwrap_or(0) & (1 << (i % 32)) != 0 {
+            let total = xma.voices.len() as u32;
+            let words = total.div_ceil(32);
+            let mut woke = false;
+            for w in 0..words {
+                let mut bits = word(w as usize).unwrap_or(0);
+                while bits != 0 {
+                    let bit = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    let i = w * 32 + bit;
+                    if i >= total {
+                        break;
+                    }
                     match command {
-                        ENABLE_XMAS => xma.enable(i),
+                        ENABLE_XMAS => {
+                            if xma.enable_no_wake(i) {
+                                woke = true;
+                            }
+                        }
                         _ => xma.disable(i),
                     }
                 }
+            }
+            if woke {
+                wake_decoder();
             }
         }
         ADVANCE_XMA_READ => xma.advance_read(word(0).unwrap_or(u32::MAX), word(1).unwrap_or(0)),
@@ -854,6 +953,7 @@ extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRES
     let mut state = state(this);
     state.connected = true;
     state.capacity = messages as usize;
+    state.messages.reserve(state.capacity.min(4096));
     S_OK
 }
 
@@ -878,35 +978,47 @@ extern "system" fn submit(
     data: *const c_void,
     notification: u32,
 ) -> HRESULT {
-    static SEEN: Mutex<u64> = Mutex::new(0);
-    if command < 64 && *lock(&SEEN) & 1 << command == 0 {
-        *lock(&SEEN) |= 1 << command;
-        tracing::info!(command, "first coprocessor command of this kind");
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if command < 64 {
+        let bit = 1u64 << command;
+        if SEEN.load(Ordering::Relaxed) & bit == 0
+            && SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0
+        {
+            tracing::info!(command, "first coprocessor command of this kind");
+        }
     }
-    let mut state = state(this);
     let word = |at: usize| -> Option<u32> {
         // SAFETY: the command's data starts with these u32 fields.
         (!data.is_null()).then(|| unsafe { data.cast::<u32>().add(at).read_unaligned() })
     };
-    match command {
-        REGISTER_MESSAGES => state.mask |= word(0).unwrap_or(0),
-        UNREGISTER_MESSAGES => state.mask &= !word(0).unwrap_or(0),
-        LOAD_FLOWGRAPH => {
-            let flowgraph = word(1).unwrap_or(0);
-            state.post(FLOWGRAPH_COMPLETED, &flowgraph.to_le_bytes());
-        }
-        _ if xma_command(command, word) => {}
+    let is_state_cmd = matches!(
+        command,
+        REGISTER_MESSAGES | UNREGISTER_MESSAGES | LOAD_FLOWGRAPH
+    );
+    if !is_state_cmd {
         // shortcut: context updates and the other SHAPE units' commands are
         // acknowledged but not carried out; add them when a title sends
         // them (each kind is logged once above).
-        _ => {}
+        let _ = xma_command(command, word);
     }
-    if id != 0 {
-        let mut done = [0u8; 16];
-        done[..4].copy_from_slice(&command.to_le_bytes());
-        done[4..12].copy_from_slice(&id.to_le_bytes());
-        done[12..].copy_from_slice(&state.frame().to_le_bytes());
-        state.post(COMMAND_COMPLETED, &done);
+    if is_state_cmd || id != 0 {
+        let mut state = state(this);
+        match command {
+            REGISTER_MESSAGES => state.mask |= word(0).unwrap_or(0),
+            UNREGISTER_MESSAGES => state.mask &= !word(0).unwrap_or(0),
+            LOAD_FLOWGRAPH => {
+                let flowgraph = word(1).unwrap_or(0);
+                state.post(FLOWGRAPH_COMPLETED, &flowgraph.to_le_bytes());
+            }
+            _ => {}
+        }
+        if id != 0 && state.mask & COMMAND_COMPLETED != 0 {
+            let mut done = [0u8; 16];
+            done[..4].copy_from_slice(&command.to_le_bytes());
+            done[4..12].copy_from_slice(&id.to_le_bytes());
+            done[12..].copy_from_slice(&state.frame().to_le_bytes());
+            state.post(COMMAND_COMPLETED, &done);
+        }
     }
     if notification != 0
         && let Some(word) = heap_unmap(notification)
@@ -1014,7 +1126,7 @@ mod tests {
         assert_eq!(ApuAlloc(&mut c, &mut apu_c, 0x800, 0x800, 1), S_OK);
         // The freed range is free again, whichever part `c` took.
         assert!(
-            lock(&HEAP)
+            read_heap()
                 .free
                 .iter()
                 .any(|(&s, &e)| s <= apu_a + 0x800 && apu_a + 0x1000 <= e)
@@ -1334,6 +1446,7 @@ mod tests {
         let mut voice = Voice {
             decoder: None,
             pcm: VecDeque::new(),
+            scratch_pcm: Vec::new(),
             skip: 0,
             ended: false,
             trace: Trace {

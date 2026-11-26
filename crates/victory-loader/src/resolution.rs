@@ -40,6 +40,25 @@
 
 use crate::frame_rate::Patched;
 
+/// Executable build profile for offset-verified resolution/upscaler patches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildProfile {
+    pub version: &'static str,
+    pub sha256: &'static str,
+    pub supported_consoles: &'static [&'static str],
+}
+
+/// Retail Xbox Series X|S build (`game_scarlett_master.exe` 1.0.2.1) against
+/// which all patch offsets in this module were verified.
+pub const RETAIL_1_0_2_1: BuildProfile = BuildProfile {
+    version: "1.0.2.1",
+    sha256: "unpinned:game_scarlett_master.exe:1.0.2.1",
+    supported_consoles: &["Xbox Series X", "Xbox Series S"],
+};
+
+/// All offset-verified title build profiles supported by this module.
+pub const SUPPORTED_BUILDS: &[BuildProfile] = &[RETAIL_1_0_2_1];
+
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
 pub const MODES: [(u32, u32); 5] = [(1280, 720), (1664, 936), (1920, 1080), (2560, 1440), (3840, 2160)];
 
@@ -112,6 +131,54 @@ pub struct Site {
 pub const SET_SCREEN_SIZE: usize = 0x2478130;
 pub const SCREEN_HEIGHT: usize = 0xa9438d0;
 pub const HEIGHT_CHANGED: usize = 0xd8c3a0;
+
+/// Minimum mapped image size required to cover every patch site and referenced
+/// global (`SCREEN_HEIGHT` at `+0xa9438d0`, 4 bytes) in [`RETAIL_1_0_2_1`].
+pub const MIN_IMAGE_SIZE: usize = SCREEN_HEIGHT + std::mem::size_of::<u32>();
+
+/// Validates that a mapped title image is large enough to contain all patch
+/// sites and referenced globals for [`RETAIL_1_0_2_1`].
+pub fn validate_image_size(size: usize) -> Result<(), String> {
+    if size < MIN_IMAGE_SIZE {
+        return Err(format!(
+            "unsupported title build: mapped image size {size:#x} ({size} bytes) is smaller than \
+             the minimum {MIN_IMAGE_SIZE:#x} bytes required for build {} ({}); resolution patches skipped",
+            RETAIL_1_0_2_1.version,
+            RETAIL_1_0_2_1.supported_consoles.join(", "),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a title executable's SHA-256 digest against [`SUPPORTED_BUILDS`].
+///
+/// Returns the matching [`BuildProfile`] on success, or a diagnostic message
+/// describing the unsupported build and listing supported versions/consoles.
+pub fn validate_build_sha256(sha256: &str) -> Result<&'static BuildProfile, String> {
+    let normalized = sha256.trim();
+    if normalized.is_empty() {
+        return Err(format!(
+            "unsupported title build: empty SHA-256 digest; expected build {} ({})",
+            RETAIL_1_0_2_1.version,
+            RETAIL_1_0_2_1.supported_consoles.join(", "),
+        ));
+    }
+    if let Some(profile) = SUPPORTED_BUILDS
+        .iter()
+        .find(|p| !p.sha256.is_empty() && p.sha256.eq_ignore_ascii_case(normalized))
+    {
+        return Ok(profile);
+    }
+    let supported: Vec<String> = SUPPORTED_BUILDS
+        .iter()
+        .map(|p| format!("{} ({})", p.version, p.supported_consoles.join(", ")))
+        .collect();
+    Err(format!(
+        "unsupported title build (sha256={normalized}): does not match any verified build profile [{}]; \
+         per-site byte verification will skip mismatched patches",
+        supported.join("; "),
+    ))
+}
 
 /// +0x22434a0 from +0x224352b to +0x2243568: the settings' size handed to
 /// the screen size.
@@ -313,6 +380,14 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     if let Some(kind) = asked_upscaler() {
         asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
     }
+    if asked.is_empty() {
+        return;
+    }
+    if let Err(msg) = validate_image_size(size) {
+        tracing::warn!("{msg}");
+        println!("resolution: {msg}");
+        return;
+    }
     for (site, code, value) in asked {
         // SAFETY: the caller's promise.
         let done = unsafe { write(base, size, site, &code) };
@@ -341,6 +416,43 @@ mod tests {
         assert_eq!(parse_render_scale("1"), Some(1.0));
         assert_eq!(parse_render_scale("0.4"), None);
         assert_eq!(parse_render_scale("1.5"), None);
+    }
+
+    #[test]
+    fn build_profile_matches_retail_1_0_2_1() {
+        let matched = validate_build_sha256(RETAIL_1_0_2_1.sha256).expect("retail profile should match");
+        assert_eq!(matched, &RETAIL_1_0_2_1);
+        assert_eq!(matched.version, "1.0.2.1");
+        assert!(matched.supported_consoles.contains(&"Xbox Series X"));
+        assert!(matched.supported_consoles.contains(&"Xbox Series S"));
+
+        // Case-insensitive and whitespace-trimmed match.
+        let padded = format!("  {}  ", RETAIL_1_0_2_1.sha256.to_ascii_uppercase());
+        assert_eq!(validate_build_sha256(&padded), Ok(&RETAIL_1_0_2_1));
+    }
+
+    #[test]
+    fn build_profile_rejects_mismatched_and_empty_sha256() {
+        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
+        let err = validate_build_sha256(wrong).unwrap_err();
+        assert!(err.contains("unsupported title build"));
+        assert!(err.contains(wrong));
+        assert!(err.contains("1.0.2.1"));
+
+        let empty_err = validate_build_sha256("   ").unwrap_err();
+        assert!(empty_err.contains("empty SHA-256"));
+        assert!(empty_err.contains("1.0.2.1"));
+    }
+
+    #[test]
+    fn image_size_validation_enforces_minimum_bounds() {
+        assert!(validate_image_size(MIN_IMAGE_SIZE).is_ok());
+        assert!(validate_image_size(MIN_IMAGE_SIZE + 0x1000).is_ok());
+
+        let err = validate_image_size(MIN_IMAGE_SIZE - 1).unwrap_err();
+        assert!(err.contains("unsupported title build"));
+        assert!(err.contains("1.0.2.1"));
+        assert!(validate_image_size(0).is_err());
     }
 
     /// The calls and loads in the bytes compared are the ones the

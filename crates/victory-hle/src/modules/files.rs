@@ -16,7 +16,7 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
@@ -41,17 +41,25 @@ pub(crate) use host;
 
 /// Mounted drives: upper-case letter and host root (UTF-16, no trailing
 /// separator, no NUL).
-static DRIVES: Mutex<Vec<(u16, Vec<u16>)>> = Mutex::new(Vec::new());
+static DRIVES: RwLock<Vec<(u16, Vec<u16>)>> = RwLock::new(Vec::new());
 
-fn drives() -> MutexGuard<'static, Vec<(u16, Vec<u16>)>> {
-    DRIVES.lock().unwrap_or_else(|e| e.into_inner())
+fn drives_read() -> RwLockReadGuard<'static, Vec<(u16, Vec<u16>)>> {
+    DRIVES.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn drives_write() -> RwLockWriteGuard<'static, Vec<(u16, Vec<u16>)>> {
+    DRIVES.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn is_mounted(letter: u16) -> bool {
+    drives_read().iter().any(|(l, _)| *l == letter)
 }
 
 /// Gives the host folder `root` a drive letter (the same one if it already
 /// has one): the highest letter neither the host nor another mount uses.
 pub fn mount(root: &Path) -> Option<char> {
     let wide = root_wide(root);
-    let mut drives = drives();
+    let mut drives = drives_write();
     if let Some(&(letter, _)) = drives.iter().find(|(_, r)| *r == wide) {
         return char::from_u32(letter.into());
     }
@@ -79,7 +87,7 @@ pub fn mount_at(letter: char, root: &Path) {
     // SAFETY: no arguments.
     let hides_host_drive = unsafe { GetLogicalDrives() } >> index & 1 != 0;
     tracing::info!(drive = %letter, root = %root.display(), hides_host_drive, "virtual drive");
-    let mut drives = drives();
+    let mut drives = drives_write();
     drives.retain(|(l, _)| u32::from(*l) != u32::from(letter));
     drives.push((letter as u16, root_wide(root)));
 }
@@ -113,17 +121,19 @@ const LONG: usize = 248;
 /// host's own clean-up, so `/` becomes `\` and `.` and `..` are resolved
 /// here (`..` stops at the root).
 fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
+    const UNC: [u16; 4] = [b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
     let backslash = u16::from(b'\\');
-    let mut out = if root.starts_with(&VERBATIM) {
-        root.to_vec()
+    let mut out = Vec::with_capacity(VERBATIM.len() + UNC.len() + root.len() + tail.len() + 1);
+    if root.starts_with(&VERBATIM) {
+        out.extend_from_slice(root);
     } else if let Some(unc) = root.strip_prefix(&[backslash; 2][..]) {
-        let mut out = VERBATIM.to_vec();
-        out.extend("UNC\\".encode_utf16());
+        out.extend_from_slice(&VERBATIM);
+        out.extend_from_slice(&UNC);
         out.extend_from_slice(unc);
-        out
     } else {
-        [&VERBATIM[..], root].concat()
-    };
+        out.extend_from_slice(&VERBATIM);
+        out.extend_from_slice(root);
+    }
     while out.last() == Some(&backslash) {
         out.pop();
     }
@@ -159,7 +169,7 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     }
     let letter = u8::try_from(letter).ok().filter(u8::is_ascii_alphabetic)?;
     let letter = u16::from(letter.to_ascii_uppercase());
-    let drives = drives();
+    let drives = drives_read();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
     let tail = &rest[2..];
     if prefix.is_empty() && root.len() + tail.len() >= LONG {
@@ -167,20 +177,26 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
         out.push(0);
         return Some(out);
     }
-    let mut out = prefix.to_vec();
-    out.extend_from_slice(root);
     // `X:` and `X:name` are relative to the root.
-    if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
+    let needs_sep = !tail.first().is_some_and(|c| SEPARATORS.contains(c));
+    let mut out =
+        Vec::with_capacity(prefix.len() + root.len() + usize::from(needs_sep) + tail.len() + 1);
+    out.extend_from_slice(prefix);
+    out.extend_from_slice(root);
+    if needs_sep {
         out.push(b'\\'.into());
     }
-    let verbatim = !prefix.is_empty();
-    out.extend(tail.iter().map(|&c| {
-        if verbatim && c == u16::from(b'/') {
-            b'\\'.into()
-        } else {
-            c
-        }
-    }));
+    if prefix.is_empty() {
+        out.extend_from_slice(tail);
+    } else {
+        out.extend(tail.iter().map(|&c| {
+            if c == u16::from(b'/') {
+                b'\\'.into()
+            } else {
+                c
+            }
+        }));
+    }
     out.push(0);
     Some(out)
 }
@@ -226,13 +242,19 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
     }
     // SAFETY: the title passes a NUL-terminated path.
     let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
-    // The drive part is ASCII in every code page; decode only candidates.
-    match bytes.strip_prefix(br"\\?\").unwrap_or(bytes) {
-        [letter, b':', ..] if letter.is_ascii_alphabetic() => {}
+    // The drive part is ASCII in every code page; decode only mounted drives.
+    let letter = match bytes.strip_prefix(br"\\?\").unwrap_or(bytes) {
+        [letter, b':', ..] if letter.is_ascii_alphabetic() => {
+            u16::from(letter.to_ascii_uppercase())
+        }
         _ => {
             tracing::debug!(path = %String::from_utf8_lossy(bytes), "title path");
             return None;
         }
+    };
+    if !is_mounted(letter) {
+        tracing::debug!(path = %String::from_utf8_lossy(bytes), "title path");
+        return None;
     }
     let len = i32::try_from(bytes.len()).ok()?;
     // SAFETY: sizing call, then a call with room for `n` units.
@@ -432,11 +454,12 @@ pub extern "system" fn GetDiskFreeSpaceW(
 ) -> i32 {
     let mut p = wide(root);
     if let Some(host) = &mut p.1
-        && let [letter, colon, sep, ..] = host[..]
+        && let [_, colon, sep, ..] = host[..]
         && colon == u16::from(b':')
         && SEPARATORS.contains(&sep)
     {
-        *host = vec![letter, colon, sep, 0];
+        host.truncate(3);
+        host.push(0);
     }
     host!("kernel32.dll", "GetDiskFreeSpaceW": extern "system" fn(*const u16, *mut u32, *mut u32, *mut u32, *mut u32) -> i32)(
         p.ptr(),

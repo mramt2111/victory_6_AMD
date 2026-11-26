@@ -52,6 +52,7 @@ pub struct Packet {
     pub skip: u32,
 }
 
+#[inline]
 pub fn packet(data: &[u8], index: usize) -> Option<Packet> {
     let start = index.checked_mul(PACKET_BYTES)?;
     let b = data.get(start..)?.get(..4)?;
@@ -83,6 +84,7 @@ struct Cursor<'a> {
 }
 
 impl Cursor<'_> {
+    #[inline]
     fn bit(&mut self) -> Option<u32> {
         if self.pos.is_multiple_of(PACKET_BITS) {
             // Leaving a packet: jump over the other streams' packets.
@@ -99,12 +101,14 @@ impl Cursor<'_> {
         Some(bit as u32)
     }
 
+    #[inline]
     fn bits(&mut self, n: u32) -> Option<u32> {
         (0..n).try_fold(0, |v, _| Some(v << 1 | self.bit()?))
     }
 
     /// A payload byte, MSB first. At a packet edge the individual bits
     /// may be separated by a header and other streams' packets.
+    #[inline]
     fn byte(&mut self) -> Option<u8> {
         let in_packet = self.pos % PACKET_BITS;
         if in_packet == 0 || in_packet > PACKET_BITS - 8 {
@@ -126,6 +130,9 @@ impl Cursor<'_> {
 /// Reads the frame starting at bit `start` (a frame start inside a packet's
 /// payload) of `data`, a buffer of whole packets of one stream.
 pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
+    if data.is_empty() {
+        return None;
+    }
     let mut cursor = Cursor { data, pos: start };
     let bits = cursor.bits(LENGTH_BITS)? as usize;
     if bits <= LENGTH_BITS as usize || bits == 0x7fff {
@@ -200,15 +207,22 @@ struct Bits<'a> {
 }
 
 impl Bits<'_> {
+    #[inline]
     fn peek32(&self) -> u32 {
-        let mut v = 0u64;
-        let byte = self.pos / 8;
-        for i in 0..5 {
-            v = v << 8 | *self.data.get(byte + i).unwrap_or(&0) as u64;
+        let byte = self.pos >> 3;
+        let shift = self.pos & 7;
+        if let Some(chunk) = self.data.get(byte..).and_then(|s| s.first_chunk::<8>()) {
+            let v = u64::from_be_bytes(*chunk);
+            return ((v << shift) >> 32) as u32;
         }
-        (v << (24 + self.pos % 8) >> 32) as u32
+        let mut v = 0u64;
+        for i in 0..5 {
+            v = (v << 8) | u64::from(self.data.get(byte + i).copied().unwrap_or(0));
+        }
+        ((v << (24 + shift)) >> 32) as u32
     }
 
+    #[inline]
     fn read(&mut self, n: u32) -> u32 {
         if n == 0 {
             return 0;
@@ -218,26 +232,38 @@ impl Bits<'_> {
         v
     }
 
+    #[inline]
     fn bit(&mut self) -> bool {
-        self.read(1) != 0
+        let pos = self.pos;
+        self.pos = pos + 1;
+        let byte = self.data.get(pos >> 3).copied().unwrap_or(0);
+        ((byte >> (7 - (pos & 7))) & 1) != 0
     }
 
+    #[inline]
     fn signed(&mut self, n: u32) -> i32 {
         ((self.read(n) << (32 - n)) as i32) >> (32 - n)
     }
 
+    #[inline]
     fn consumed(&self) -> usize {
         self.pos
     }
 
+    #[inline]
     fn overread(&self) -> bool {
         self.pos > self.end
     }
 }
 
+const VLC_LUT_BITS: u32 = 9;
+const VLC_LUT_SIZE: usize = 1 << VLC_LUT_BITS;
+
 /// A prefix code built like FFmpeg's `ff_vlc_init_from_lengths`: codes are
 /// handed out in table order, each the next free one of its length.
 struct Vlc {
+    /// Direct lookup for codes of length <= `VLC_LUT_BITS`; `len == 0` falls back to `codes`.
+    lut: [(u8, i32); VLC_LUT_SIZE],
     /// Left-aligned code, length, symbol; sorted by code.
     codes: Vec<(u32, u8, i32)>,
 }
@@ -245,16 +271,31 @@ struct Vlc {
 impl Vlc {
     fn new(entries: impl Iterator<Item = (i32, u8)>) -> Vlc {
         let mut code = 0u64;
-        let mut codes = Vec::new();
+        let mut codes = Vec::with_capacity(entries.size_hint().0);
+        let mut lut = [(0u8, 0i32); VLC_LUT_SIZE];
         for (symbol, len) in entries {
-            codes.push((code as u32, len, symbol));
-            code += 1 << (32 - len);
+            let c = code as u32;
+            codes.push((c, len, symbol));
+            if len > 0 && len <= VLC_LUT_BITS as u8 {
+                let start = (c >> (32 - VLC_LUT_BITS)) as usize;
+                let count = 1usize << (VLC_LUT_BITS as u8 - len);
+                if let Some(slots) = lut.get_mut(start..start + count) {
+                    slots.fill((len, symbol));
+                }
+            }
+            code += 1u64 << (32 - len);
         }
-        Vlc { codes }
+        Vlc { lut, codes }
     }
 
+    #[inline]
     fn read(&self, bits: &mut Bits) -> i32 {
         let v = bits.peek32();
+        let (len, symbol) = self.lut[(v >> (32 - VLC_LUT_BITS)) as usize];
+        if len != 0 {
+            bits.pos += len as usize;
+            return symbol;
+        }
         let i = self.codes.partition_point(|c| c.0 <= v) - 1;
         let (_, len, symbol) = self.codes[i];
         bits.pos += len as usize;
@@ -271,6 +312,7 @@ struct Codes {
     vec1: Vlc,
 }
 
+#[inline]
 fn codes() -> &'static Codes {
     static CODES: OnceLock<Codes> = OnceLock::new();
     CODES.get_or_init(|| {
@@ -292,6 +334,7 @@ fn codes() -> &'static Codes {
 }
 
 /// `ff_wma_get_large_val`.
+#[inline]
 fn large_value(bits: &mut Bits) -> u32 {
     let mut n = 8;
     if bits.bit() {
@@ -306,6 +349,7 @@ fn large_value(bits: &mut Bits) -> u32 {
     bits.read(n)
 }
 
+#[inline]
 fn log2(v: usize) -> u32 {
     usize::BITS - 1 - v.max(1).leading_zeros()
 }
@@ -321,6 +365,9 @@ fn log2(v: usize) -> u32 {
 /// a subframe costs no sines or cosines and no allocation.
 fn imdct_half(input: &[f32], out: &mut [f32], scale: f32) {
     let n = input.len();
+    if n == 0 {
+        return;
+    }
     let m = n / 2;
     let built;
     let rotations = match rotations().get(log2(n).wrapping_sub(7) as usize) {
@@ -479,6 +526,7 @@ fn butterfly_block(
 }
 
 /// [`Rotations`] for subframes of 128, 256 and 512 samples.
+#[inline]
 fn rotations() -> &'static [Rotations; 3] {
     static ROTATIONS: OnceLock<[Rotations; 3]> = OnceLock::new();
     ROTATIONS.get_or_init(|| {
@@ -644,6 +692,13 @@ impl Decoder {
     /// Decodes one frame (`frame.data`, `frame.bits`) and appends
     /// `FRAME_SAMPLES` interleaved samples per channel to `out`.
     pub fn decode(&mut self, data: &[u8], bits: usize, out: &mut Vec<i16>) -> Result<(), Error> {
+        if data.is_empty() {
+            for c in 0..self.channels {
+                self.ch[c].out = [0.0; FRAME_SAMPLES + FRAME_SAMPLES / 2];
+            }
+            out.resize(out.len() + FRAME_SAMPLES * self.channels, 0);
+            return Err(Error("tile header"));
+        }
         let mut b = Bits {
             data,
             pos: 0,
@@ -660,6 +715,7 @@ impl Decoder {
                 self.ch[c].out = [0.0; FRAME_SAMPLES + FRAME_SAMPLES / 2];
             }
         }
+        out.reserve(FRAME_SAMPLES * self.channels);
         for i in 0..FRAME_SAMPLES {
             for c in 0..self.channels {
                 out.push(to_i16(self.ch[c].out[i]));
@@ -674,6 +730,7 @@ impl Decoder {
     /// The overlap left after the last frame, then silence: half a frame of
     /// samples per channel.
     pub fn flush(&mut self, out: &mut Vec<i16>) {
+        out.reserve((FRAME_SAMPLES / 2) * self.channels);
         for i in 0..FRAME_SAMPLES / 2 {
             for c in 0..self.channels {
                 out.push(to_i16(self.ch[c].out[i]));
@@ -1105,6 +1162,7 @@ impl Decoder {
         }
 
         // Window and overlap-add with the previous block.
+        let wins = windows();
         for i in 0..self.channels_for_cur_subframe {
             let ch = &mut self.ch[self.channel_indexes[i]];
             let mut winlen = ch.prev_block_len;
@@ -1113,7 +1171,7 @@ impl Decoder {
                 start += (winlen - subframe_len) / 2;
                 winlen = subframe_len;
             }
-            window_overlap(&mut ch.out[start..start + winlen], &windows()[log2(winlen) as usize - 7]);
+            window_overlap(&mut ch.out[start..start + winlen], &wins[log2(winlen) as usize - 7]);
             ch.prev_block_len = subframe_len;
         }
 
@@ -1154,6 +1212,7 @@ impl Decoder {
 }
 
 /// Sine windows for blocks of 128, 256 and 512 samples.
+#[inline]
 fn windows() -> &'static [Vec<f32>; 3] {
     static WINDOWS: OnceLock<[Vec<f32>; 3]> = OnceLock::new();
     WINDOWS.get_or_init(|| [sine_window(128), sine_window(256), sine_window(512)])
@@ -1161,6 +1220,7 @@ fn windows() -> &'static [Vec<f32>; 3] {
 
 /// FFmpeg's `vector_fmul_window` in place: the first half of `block` holds
 /// the previous block's tail, the second half the current block's head.
+#[inline]
 fn window_overlap(block: &mut [f32], window: &[f32]) {
     let len = block.len() / 2;
     for k in 0..len {
@@ -1172,6 +1232,7 @@ fn window_overlap(block: &mut [f32], window: &[f32]) {
     }
 }
 
+#[inline]
 fn to_i16(v: f32) -> i16 {
     (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16
 }
