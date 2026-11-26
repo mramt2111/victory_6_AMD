@@ -721,11 +721,11 @@ fn wave_local_checked(
     fn of(kind: &HashMap<Value, Wave>, v: Option<Value>) -> Wave {
         v.and_then(|v| kind.get(&v).copied()).unwrap_or(Wave::Plain)
     }
-    fn put(kind: &mut HashMap<Value, Wave>, v: Value, k: Wave) {
+    fn put(kind: &mut HashMap<Value, Wave>, v: Value, k: Wave) -> bool {
         if k == Wave::Plain {
-            kind.remove(&v);
+            kind.remove(&v).is_some()
         } else {
-            kind.insert(v, k);
+            kind.insert(v, k) != Some(k)
         }
     }
     let wild = |k: Wave| !matches!(k, Wave::Plain | Wave::Base);
@@ -877,7 +877,9 @@ fn wave_local_checked(
     };
     let sections: Vec<_> = (0..p.blocks.len()).map(|b| super::wave::sections(p, b)).collect();
     let order = crate::ir::reverse_postorder(&p.blocks);
-    let pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, check: bool| -> Result<(), (usize, Why)> {
+    let pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, check: bool| -> Result<bool, (usize, Why)> {
+        let mut changed = false;
+        let before_firsts = firsts.len();
         for &b in &order {
             let block = &p.blocks[b];
             for phi in &block.phis {
@@ -892,7 +894,7 @@ fn wave_local_checked(
                         _ => Wave::Mixed,
                     };
                 }
-                put(kind, phi.value, k);
+                changed |= put(kind, phi.value, k);
             }
             for (i, inst) in block.insts.iter().enumerate() {
                 // inside a whole-wave section: what the simulation found each value to be
@@ -916,7 +918,7 @@ fn wave_local_checked(
                             },
                             Some(_) => Wave::Mixed,
                         };
-                        put(kind, w, k);
+                        changed |= put(kind, w, k);
                     }
                     continue;
                 }
@@ -984,7 +986,7 @@ fn wave_local_checked(
                     {
                         kw = Wave::Mixed;
                     }
-                    put(kind, w, kw);
+                    changed |= put(kind, w, kw);
                 }
             }
             // a branch on "some lane is counted": fine where the structure made it the lane's
@@ -1002,16 +1004,14 @@ fn wave_local_checked(
                 }
             }
         }
-        Ok(())
+        Ok(changed || firsts.len() != before_firsts)
     };
     let mut kind: HashMap<Value, Wave> = HashMap::new();
     let mut firsts: HashSet<Value> = HashSet::new();
     // to a fixpoint (values carried around loops), then once more to say what is wrong
     let mut settled = false;
     for _ in 0..16 {
-        let before = (kind.clone(), firsts.len());
-        pass(&mut kind, &mut firsts, false)?;
-        if (&before.0, before.1) == (&kind, firsts.len()) {
+        if !pass(&mut kind, &mut firsts, false)? {
             settled = true;
             break;
         }
@@ -1019,7 +1019,7 @@ fn wave_local_checked(
     if !settled {
         return Err((0, MIXED));
     }
-    pass(&mut kind, &mut firsts, true)
+    pass(&mut kind, &mut firsts, true).map(|_| ())
 }
 
 /// The mode of a group barrier the translation adds (host waves meeting):

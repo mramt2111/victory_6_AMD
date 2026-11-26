@@ -231,14 +231,19 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
+        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 && !self.blocks.is_empty() {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
             // branch that goes one way leaves blocks with one way in.
+            let effects = self.effects();
+            let mut tree: Option<Tree> = None;
             for _ in 0..4 {
-                let mut changed = self.merge(passes);
-                if passes & FOLD != 0 {
-                    changed |= self.prune();
+                let dom = tree.get_or_insert_with(|| self.dominator_tree());
+                let mut changed = self.merge(passes, &effects, dom);
+                if passes & FOLD != 0 && self.prune() {
+                    changed = true;
+                    // CFG changed: invalidate cached dominator tree.
+                    tree = None;
                 }
                 if !changed {
                     break;
@@ -754,12 +759,10 @@ impl Module {
 
     /// [`FOLD`], [`REUSE`], [`FACTS`] and [`LOADS`]: one walk over the
     /// dominator tree. Returns whether anything changed.
-    fn merge(&mut self, passes: u32) -> bool {
+    fn merge(&mut self, passes: u32, effects: &[Effect], tree: &Tree) -> bool {
         if self.blocks.is_empty() {
             return false;
         }
-        let effects = self.effects();
-        let tree = self.dominator_tree();
         let mut repl: Vec<Option<V>> = vec![None; self.insts.len()];
         let mut changed = false;
         // Joins of one value: until none is left (one gone can leave
@@ -800,23 +803,28 @@ impl Module {
         }
         // The values every path to the block being walked has computed
         // (those of the blocks above it in the tree, and its own so far).
-        let mut known: HashMap<Key, V> = HashMap::new();
+        // Each entry records its defining block; `active[owner]` distinguishes
+        // dominating ancestors from stale sibling-branch entries without
+        // cloning keys into an undo list.
+        let mut known: HashMap<Key, (V, usize)> = HashMap::new();
+        let mut active = vec![false; self.blocks.len()];
         // The reads of the block being walked since its last store.
         let mut read: HashMap<Key, V> = HashMap::new();
         let mut facts = Facts::default();
         let (yes, no) = (self.bool(true), self.bool(false));
         enum Step {
             Enter(usize),
-            Leave(Vec<Key>, Learned),
+            Leave(usize, Learned),
         }
         let mut steps = vec![Step::Enter(0)];
         while let Some(step) = steps.pop() {
             let b = match step {
-                Step::Enter(b) => b,
-                Step::Leave(keys, learned) => {
-                    for k in keys {
-                        known.remove(&k);
-                    }
+                Step::Enter(b) => {
+                    active[b] = true;
+                    b
+                }
+                Step::Leave(b, learned) => {
+                    active[b] = false;
                     for v in learned.bits {
                         facts.bits.remove(&v);
                     }
@@ -826,7 +834,6 @@ impl Module {
                     continue;
                 }
             };
-            let mut added = Vec::new();
             // Reached from one block alone, by one side of its branch: the
             // condition is that side's, here and in every block below.
             let mut learned = Learned::default();
@@ -896,18 +903,25 @@ impl Module {
                     changed = true;
                     continue;
                 }
-                let class = self.class(&effects, i);
+                let class = self.class(effects, i);
                 if passes & REUSE != 0
                     && class == Effect::Pure
                     && let Some(key) = self.key(i)
                 {
-                    if let Some(&first) = known.get(&key) {
-                        repl[i as usize] = Some(first);
-                        changed = true;
-                        continue;
+                    match known.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            let (first, owner) = *e.get();
+                            if active[owner] {
+                                repl[i as usize] = Some(first);
+                                changed = true;
+                                continue;
+                            }
+                            e.insert((V::Inst(i), b));
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert((V::Inst(i), b));
+                        }
                     }
-                    known.insert(key.clone(), V::Inst(i));
-                    added.push(key);
                 }
                 // Reads of memory, and wave operations (the same lanes run
                 // the whole block): the block's own earlier one.
@@ -932,7 +946,7 @@ impl Module {
                 let c = known_bit(&facts, resolve(&repl, c));
                 self.blocks[b].term = Some(Term::CondBr(c, t, f));
             }
-            steps.push(Step::Leave(added, learned));
+            steps.push(Step::Leave(b, learned));
             for &c in tree.children[b].iter().rev() {
                 steps.push(Step::Enter(c));
             }

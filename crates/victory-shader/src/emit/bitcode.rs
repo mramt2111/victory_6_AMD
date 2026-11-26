@@ -272,13 +272,15 @@ impl Module {
     }
 
     fn constant(&mut self, ty: Ty, c: Const) -> V {
-        if let Some(&i) = self.const_ids.get(&(ty, c.clone())) {
-            return V::Const(i);
+        let key = (ty, c);
+        match self.const_ids.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => V::Const(*e.get()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let i = self.consts.len() as u32;
+                self.consts.push(e.key().clone());
+                V::Const(*e.insert(i))
+            }
         }
-        let i = self.consts.len() as u32;
-        self.consts.push((ty, c.clone()));
-        self.const_ids.insert((ty, c), i);
-        V::Const(i)
     }
 
     pub fn int_const(&mut self, ty: Ty, v: i64) -> V {

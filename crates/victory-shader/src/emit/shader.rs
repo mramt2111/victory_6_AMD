@@ -382,15 +382,26 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
-        let mut params = vec![self.t.i32];
+        let mut params = Vec::with_capacity(1 + args.len());
+        params.push(self.t.i32);
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
         self.m.ptr(fty);
-        let f = self
-            .m
-            .function(&format!("dx.op.{name}"), fty, Some(attr), false);
-        let mut all = vec![self.m.i32(opcode)];
-        all.extend(args);
+        let mut name_buf = [0u8; 64];
+        let full_name: std::borrow::Cow<'_, str> = if 6 + name.len() <= name_buf.len() {
+            name_buf[..6].copy_from_slice(b"dx.op.");
+            name_buf[6..6 + name.len()].copy_from_slice(name.as_bytes());
+            std::borrow::Cow::Borrowed(std::str::from_utf8(&name_buf[..6 + name.len()]).unwrap())
+        } else {
+            let mut s = String::with_capacity(6 + name.len());
+            s.push_str("dx.op.");
+            s.push_str(name);
+            std::borrow::Cow::Owned(s)
+        };
+        let f = self.m.function(&full_name, fty, Some(attr), false);
+        let mut all = Vec::with_capacity(1 + args.len());
+        all.push(self.m.i32(opcode));
+        all.extend_from_slice(args);
         self.m.call(block, f, all)
     }
 
@@ -841,7 +852,13 @@ impl Shader {
             self.flags |= flags::UAVS_EVERY_STAGE;
         }
         let mut resources = None;
-        let mut bindings = Vec::new();
+        let mut bindings = Vec::with_capacity(
+            usize::from(self.user_data > 0)
+                + self.root_cbvs.len()
+                + self.root_srvs.len()
+                + self.root_uavs.len()
+                + self.samplers as usize,
+        );
         let i32c = |s: &mut Self, v: u32| {
             let c = s.m.i32(v);
             s.m.md_value(c)
@@ -854,7 +871,8 @@ impl Shader {
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
-            let mut cbv_list = Vec::new();
+            let mut cbv_list =
+                Vec::with_capacity(usize::from(self.user_data > 0) + self.root_cbvs.len());
             if self.user_data > 0 {
                 let arr = self.m.array(self.user_data.next_multiple_of(4), self.t.i32);
                 let ty = self.m.named_struct("UserData", vec![arr]);
@@ -882,7 +900,7 @@ impl Shader {
             let ty = self.m.named_struct("RootCbv", vec![blob]);
             let p = self.m.ptr(ty);
             let u = self.m.undef(p);
-            for (slot, _) in self.root_cbvs.clone() {
+            for (slot, _) in std::mem::take(&mut self.root_cbvs) {
                 let ops = vec![
                     Some(i32c(&mut self, cbv_list.len() as u32)),
                     Some(self.m.md_value(u)),
@@ -909,8 +927,9 @@ impl Shader {
                 let mut raw_u = None;
                 let mut rtas_u = None;
                 let mut rtas_extra = None;
-                let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                let root_srvs = std::mem::take(&mut self.root_srvs);
+                let mut list = Vec::with_capacity(root_srvs.len());
+                for (n, (slot, _)) in root_srvs.into_iter().enumerate() {
                     if self.rtas_root_srvs.contains(&slot) {
                         let u = *rtas_u.get_or_insert_with(|| {
                             let ty = self.m.named_struct(
@@ -983,8 +1002,9 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
-                let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                let root_uavs = std::mem::take(&mut self.root_uavs);
+                let mut list = Vec::with_capacity(root_uavs.len());
+                for (n, (slot, _)) in root_uavs.into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
                     // shape (11: raw buffer), globally coherent, counter,
                     // rasterizer ordered, no extra properties.
@@ -1016,7 +1036,7 @@ impl Shader {
                 let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
-                let mut list = Vec::new();
+                let mut list = Vec::with_capacity(self.samplers as usize);
                 for n in 0..self.samplers {
                     let kind = (self.cmp_samplers >> n & 1) as u32;
                     let ops = vec![
@@ -1064,7 +1084,13 @@ impl Shader {
                     .unwrap_or(0)
             };
             let (ni, no) = (scalars(&self.inputs), scalars(&self.outputs));
-            let mut view = vec![ni, no];
+            let mut view = Vec::with_capacity(
+                2 + usize::from(self.mesh.is_some())
+                    + (ni * no.div_ceil(32)) as usize
+                    + if self.geometry.is_some() { 3 } else { 0 },
+            );
+            view.push(ni);
+            view.push(no);
             // Mesh shaders have no inputs: then the primitive outputs' count.
             if self.mesh.is_some() {
                 view.push(scalars(&self.prims));
@@ -1093,9 +1119,9 @@ impl Shader {
         }
 
         let sigs = if graphics {
-            let ins = self.signature_md(self.inputs.clone());
-            let outs = self.signature_md(self.outputs.clone());
-            let prims = self.signature_md(self.prims.clone());
+            let ins = Self::signature_md(&mut self.m, &self.inputs);
+            let outs = Self::signature_md(&mut self.m, &self.outputs);
+            let prims = Self::signature_md(&mut self.m, &self.prims);
             Some(self.m.md_node(vec![ins, outs, prims]))
         } else {
             None
@@ -1135,7 +1161,8 @@ impl Shader {
                         0,
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
-                    let mut node = vec![Some(t)];
+                    let mut node = Vec::with_capacity(5);
+                    node.push(Some(t));
                     node.extend(state);
                     props.push(self.m.md_node(node));
                 }
@@ -1252,8 +1279,10 @@ impl Shader {
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
-        let mut parts: Vec<(&[u8; 4], &[u8])> =
-            vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];
+        let mut parts: Vec<(&[u8; 4], &[u8])> = Vec::with_capacity(7);
+        parts.push((b"SFI0", &sfi0));
+        parts.push((b"ISG1", &isg1));
+        parts.push((b"OSG1", &osg1));
         if self.mesh.is_some() {
             parts.push((b"PSG1", &psg1));
         }
@@ -1270,43 +1299,43 @@ impl Shader {
         self.m.replace_const(old, new);
     }
 
-    fn signature_md(&mut self, elements: Vec<SigElement>) -> Option<Md> {
+    fn signature_md(m: &mut Module, elements: &[SigElement]) -> Option<Md> {
         if elements.is_empty() {
             return None;
         }
-        let mut list = Vec::new();
+        let mut list = Vec::with_capacity(elements.len());
         for (id, e) in elements.iter().enumerate() {
-            let c32 = |s: &mut Self, v: u32| {
-                let c = s.m.i32(v);
-                Some(s.m.md_value(c))
+            let c32 = |m: &mut Module, v: u32| {
+                let c = m.i32(v);
+                Some(m.md_value(c))
             };
-            let c8 = |s: &mut Self, v: u8| {
-                let c = s.m.i8(v);
-                Some(s.m.md_value(c))
+            let c8 = |m: &mut Module, v: u8| {
+                let c = m.i8(v);
+                Some(m.md_value(c))
             };
-            let idx = c32(self, e.index);
-            let indices = Some(self.m.md_node(vec![idx]));
+            let idx = c32(m, e.index);
+            let indices = Some(m.md_node(vec![idx]));
             let usage = if e.usage != 0 {
-                let (tag, mask) = (c32(self, 3), c32(self, u32::from(e.usage)));
-                Some(self.m.md_node(vec![tag, mask]))
+                let (tag, mask) = (c32(m, 3), c32(m, u32::from(e.usage)));
+                Some(m.md_node(vec![tag, mask]))
             } else {
                 None
             };
             let ops = vec![
-                c32(self, id as u32),
-                Some(self.m.md_str(&e.name)),
-                c8(self, e.comp),
-                c8(self, e.kind),
+                c32(m, id as u32),
+                Some(m.md_str(&e.name)),
+                c8(m, e.comp),
+                c8(m, e.kind),
                 indices,
-                c8(self, e.interp),
-                c32(self, 1),
-                c8(self, e.cols),
-                c32(self, e.row.unwrap_or(u32::MAX)),
-                c8(self, if e.row.is_some() { e.col } else { u8::MAX }),
+                c8(m, e.interp),
+                c32(m, 1),
+                c8(m, e.cols),
+                c32(m, e.row.unwrap_or(u32::MAX)),
+                c8(m, if e.row.is_some() { e.col } else { u8::MAX }),
                 usage,
             ];
-            list.push(Some(self.m.md_node(ops)));
+            list.push(Some(m.md_node(ops)));
         }
-        Some(self.m.md_node(list))
+        Some(m.md_node(list))
     }
 }

@@ -16,6 +16,7 @@
 //! their side effects are dropped too, and what they compute is only read
 //! through derivatives.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -68,6 +69,7 @@ pub struct Bools {
 
 /// The tables below have small integer keys; SipHash dominated run time.
 type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+type Set<K> = HashSet<K, BuildHasherDefault<Fx>>;
 
 /// FxHash's multiply-rotate step.
 #[derive(Default)]
@@ -114,18 +116,28 @@ pub struct Meets {
 
 impl Bools {
     fn new() -> Self {
+        let mut nodes = Vec::with_capacity(256);
+        nodes.push((TERMINAL, Bool::FALSE, Bool::FALSE));
+        nodes.push((TERMINAL, Bool::TRUE, Bool::TRUE));
         Bools {
-            nodes: vec![
-                (TERMINAL, Bool::FALSE, Bool::FALSE),
-                (TERMINAL, Bool::TRUE, Bool::TRUE),
-            ],
-            unique: Map::default(),
-            memo: Map::default(),
-            atoms: Vec::new(),
-            born: Vec::new(),
-            ids: Map::default(),
+            nodes,
+            unique: Map::with_capacity_and_hasher(256, Default::default()),
+            memo: Map::with_capacity_and_hasher(256, Default::default()),
+            atoms: Vec::with_capacity(64),
+            born: Vec::with_capacity(64),
+            ids: Map::with_capacity_and_hasher(64, Default::default()),
             overflow: false,
         }
+    }
+
+    fn reset(&mut self) {
+        self.nodes.truncate(2);
+        self.unique.clear();
+        self.memo.clear();
+        self.atoms.clear();
+        self.born.clear();
+        self.ids.clear();
+        self.overflow = false;
     }
 
     /// The atom tested at the top of `b` and the results when it is false
@@ -143,13 +155,12 @@ impl Bools {
     }
 
     fn vars(&self, b: Bool) -> Vec<u32> {
-        let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![b]);
+        let (mut seen, mut vars, mut stack) = (Set::default(), Vec::new(), vec![b]);
         while let Some(b) = stack.pop() {
             let (v, lo, hi) = self.nodes[b.0 as usize];
-            if v == TERMINAL || seen.contains(&b) {
+            if v == TERMINAL || !seen.insert(b) {
                 continue;
             }
-            seen.push(b);
             if !vars.contains(&v) {
                 vars.push(v);
             }
@@ -171,18 +182,19 @@ impl Bools {
         if lo == hi {
             return lo;
         }
-        if let Some(&b) = self.unique.get(&(v, lo, hi)) {
-            return b;
+        match self.unique.entry((v, lo, hi)) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                if self.nodes.len() >= MAX_NODES {
+                    // The caller fails once it sees `overflow`.
+                    self.overflow = true;
+                    return Bool::FALSE;
+                }
+                let b = Bool(self.nodes.len() as u32);
+                self.nodes.push((v, lo, hi));
+                *e.insert(b)
+            }
         }
-        if self.nodes.len() >= MAX_NODES {
-            // The caller fails once it sees `overflow`.
-            self.overflow = true;
-            return Bool::FALSE;
-        }
-        let b = Bool(self.nodes.len() as u32);
-        self.nodes.push((v, lo, hi));
-        self.unique.insert((v, lo, hi), b);
-        b
     }
 
     /// Cofactors of `b` for `v`, which is `b`'s top variable or above it.
@@ -212,6 +224,9 @@ impl Bools {
         let lo = self.ite(f0, g0, h0);
         let hi = self.ite(f1, g1, h1);
         let r = self.mk(v, lo, hi);
+        if self.memo.len() > (1 << 18) {
+            self.memo.clear();
+        }
         self.memo.insert((f, g, h), r);
         r
     }
@@ -378,13 +393,19 @@ impl Bools {
 
     /// `b` with each atom that `known` decides replaced by its value.
     fn given(&mut self, mut b: Bool, known: Bool) -> Bool {
+        if b == Bool::FALSE || b == Bool::TRUE {
+            return b;
+        }
+        let mut memo = Map::default();
         for v in self.vars(b) {
             let x = self.mk(v, Bool::FALSE, Bool::TRUE);
             let nx = self.not(x);
             if self.implies(known, x) {
-                b = self.restrict(b, v, true, &mut Map::default());
+                memo.clear();
+                b = self.restrict(b, v, true, &mut memo);
             } else if self.implies(known, nx) {
-                b = self.restrict(b, v, false, &mut Map::default());
+                memo.clear();
+                b = self.restrict(b, v, false, &mut memo);
             }
         }
         b
@@ -479,7 +500,7 @@ pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Struct
             return Err(TOO_LARGE);
         }
         if wrong.is_empty() && new_derived.is_empty() {
-            return l.finish(&execs, &cond);
+            return l.finish(&execs, cond);
         }
         l.unresolved.extend(wrong);
         l.derived_phis.extend(new_derived);
@@ -503,10 +524,10 @@ struct Lanes<'a> {
     /// Block and index of each phi value.
     phis: Map<Value, (usize, usize)>,
     /// Mask joins found wrong when resolved to a constant: atoms instead.
-    unresolved: HashSet<Value>,
+    unresolved: Set<Value>,
     /// Phi ids whose joins depend on EXEC or VALU results (including along
     /// back edges), carried across resets so their joins stay in `masks`.
-    derived_phis: HashSet<Value>,
+    derived_phis: Set<Value>,
     b: Bools,
     /// Masks derived from EXEC and VALU results.
     masks: Map<Key, Bool>,
@@ -523,7 +544,7 @@ struct Lanes<'a> {
     /// [`Atom::Phi`] joins created in the current pass, resolved in
     /// `check_joins` and exported in `finish`.
     phi_joins: Vec<PhiJoin>,
-    phi_join_ids: HashSet<Value>,
+    phi_join_ids: Set<Value>,
     /// Per block: what a lane knows on entry, over forward edges only.
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
@@ -534,7 +555,7 @@ struct Lanes<'a> {
     wide: HashSet<usize>,
     /// SCC values of [`Self::scc_lane`] that are set when EVERY lane's bit is (`s_cmp_eq` of
     /// two masks: "no lane differs"); the others are set when some lane's is.
-    scc_every: HashSet<Value>,
+    scc_every: Set<Value>,
     /// See [`Structured::wave_any`].
     wave_any: Vec<Option<bool>>,
 }
@@ -580,10 +601,18 @@ impl<'a> Lanes<'a> {
         }
         check_reducible(p, &order, &index)?;
         let mut incoming = vec![Vec::new(); blocks.len()];
-        let (mut defs, mut phis) = (Map::default(), Map::default());
+        let total_insts: usize = blocks.iter().map(|b| b.insts.len()).sum();
+        let total_phis: usize = blocks.iter().map(|b| b.phis.len()).sum();
+        let mut defs = Map::with_capacity_and_hasher(total_insts, Default::default());
+        let mut phis = Map::with_capacity_and_hasher(total_phis, Default::default());
         for (b, block) in blocks.iter().enumerate() {
-            for (k, s) in block.exit.successors().into_iter().enumerate() {
-                incoming[s].push((b, k == 0));
+            match block.exit {
+                Exit::Jump(s) => incoming[s].push((b, true)),
+                Exit::Branch { taken, not_taken } => {
+                    incoming[taken].push((b, true));
+                    incoming[not_taken].push((b, false));
+                }
+                Exit::End | Exit::Indirect => {}
             }
             for (i, phi) in block.phis.iter().enumerate() {
                 phis.insert(phi.value, (b, i));
@@ -601,27 +630,27 @@ impl<'a> Lanes<'a> {
             incoming,
             defs,
             phis,
-            unresolved: HashSet::new(),
-            derived_phis: HashSet::new(),
+            unresolved: Set::default(),
+            derived_phis: Set::default(),
             b: Bools::new(),
-            masks: Map::default(),
-            other: Map::default(),
+            masks: Map::with_capacity_and_hasher(blocks.len() * 2, Default::default()),
+            other: Map::with_capacity_and_hasher(blocks.len(), Default::default()),
             seen: Vec::new(),
             scc_lane: Map::default(),
             joins: Vec::new(),
             phi_joins: Vec::new(),
-            phi_join_ids: HashSet::new(),
+            phi_join_ids: Set::default(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
             wide: HashSet::new(),
-            scc_every: HashSet::new(),
+            scc_every: Set::default(),
             wave_any: vec![None; blocks.len()],
         })
     }
 
     fn reset(&mut self) {
-        self.b = Bools::new();
+        self.b.reset();
         self.masks.clear();
         self.other.clear();
         self.seen.clear();
@@ -713,7 +742,8 @@ impl<'a> Lanes<'a> {
     fn check_joins(&mut self, cond: &[Bool]) -> (Vec<Value>, Vec<Value>) {
         let mut wrong = Vec::new();
         let mut new_derived = Vec::new();
-        let mut seen_derived = HashSet::new();
+        let mut seen_derived = Set::default();
+        let mut args_buf: Vec<Key> = Vec::new();
         let mut j = 0;
         let mut p = 0;
         // Checking an argument can resolve another join; it is checked too.
@@ -725,8 +755,10 @@ impl<'a> Lanes<'a> {
                     self.joins[j].value,
                     self.joins[j].derived,
                 );
+                args_buf.clear();
+                args_buf.extend_from_slice(&self.joins[j].args);
                 let mut failed = false;
-                for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
+                for (n, &a) in args_buf.iter().enumerate() {
                     let (q, taken) = self.incoming[block][n];
                     let e = self.edge(cond[q], q, taken);
                     let (mut m, d) = self.mask(a);
@@ -749,7 +781,9 @@ impl<'a> Lanes<'a> {
             }
             while p < self.phi_joins.len() {
                 let (id, was_derived) = (self.phi_joins[p].id, self.phi_joins[p].derived);
-                for a in self.phi_joins[p].args.clone() {
+                args_buf.clear();
+                args_buf.extend_from_slice(&self.phi_joins[p].args);
+                for &a in &args_buf {
                     let (_, d) = self.mask(a);
                     if !was_derived
                         && d
@@ -768,7 +802,7 @@ impl<'a> Lanes<'a> {
     fn finish(
         mut self,
         execs: &[Vec<Option<Bool>>],
-        cond: &[Bool],
+        cond: Vec<Bool>,
     ) -> Result<Structured, ShaderError> {
         let phi_joins = std::mem::take(&mut self.phi_joins);
         let mut phi_masks = HashMap::with_capacity(phi_joins.len());
@@ -840,7 +874,10 @@ impl<'a> Lanes<'a> {
         // lowering refuses what reads it instead of taking the other
         // pair's lanes 32-63. Not where the low dword holds a number: see
         // the shortcut in `mask`.
-        let (mut high, mut split) = (Map::default(), HashSet::new());
+        let (mut high, mut split) = (
+            Map::with_capacity_and_hasher(self.masks.len() + self.other.len(), Default::default()),
+            Set::default(),
+        );
         let keys = self.masks.keys().chain(self.other.keys());
         for &(lo, hi) in keys.chain(&self.seen) {
             if *high.entry(lo).or_insert(hi) != hi {
@@ -871,7 +908,7 @@ impl<'a> Lanes<'a> {
             bools: self.b,
             exits,
             guards,
-            reach: cond.to_vec(),
+            reach: cond,
         })
     }
 
@@ -972,7 +1009,7 @@ impl<'a> Lanes<'a> {
         let id = lo.map_or(k.1, |_| k.0);
         let mut derived = self.derived_phis.contains(&id);
         // (edge condition, mask) per forward edge; back edges come later.
-        let mut forward = Vec::new();
+        let mut forward = Vec::with_capacity(args.len());
         for (n, &a) in args.iter().enumerate() {
             let (q, taken) = self.incoming[block][n];
             if self.index[q] < self.index[block] {
@@ -1379,6 +1416,7 @@ impl<'a> Lanes<'a> {
         if let Some(&entry) = self.order.first() {
             cond[entry] = Bool::TRUE;
         }
+        let mut forget_memo = Map::default();
         for _ in 0..MAX_ROUNDS {
             let mut changed = false;
             for i in 1..self.order.len() {
@@ -1388,7 +1426,8 @@ impl<'a> Lanes<'a> {
                     let (q, taken) = self.incoming[s][k];
                     let mut e = self.edge(cond[q], q, taken);
                     if i <= self.index[q] {
-                        e = self.b.forget(e, i, &mut Map::default());
+                        forget_memo.clear();
+                        e = self.b.forget(e, i, &mut forget_memo);
                     }
                     c = self.b.or(c, e);
                 }

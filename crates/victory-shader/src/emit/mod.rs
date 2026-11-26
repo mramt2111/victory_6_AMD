@@ -117,6 +117,8 @@ mod wave;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
@@ -223,18 +225,42 @@ pub fn builder_bounds() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
 }
 
+/// Host DXR 1.1 (`RayQuery`) capability state set by [`set_native_rt_supported`]:
+/// `0` = unset (env-only), `1` = unsupported, `2` = supported.
+static NATIVE_RT_SUPPORTED: AtomicU8 = AtomicU8::new(0);
+
+fn store_native_rt_supported(slot: &AtomicU8, supported: bool) {
+    slot.store(if supported { 2 } else { 1 }, Ordering::Relaxed);
+}
+
+fn native_rt_with(slot: &AtomicU8, env_enabled: bool) -> bool {
+    if slot.load(Ordering::Relaxed) == 1 {
+        return false;
+    }
+    env_enabled
+}
+
+/// Records whether the host D3D12 device supports DXR 1.1 (`RayQuery`).
+/// When `false`, [`native_rt`] always returns `false` regardless of
+/// `VICTORY_NATIVE_RT=1`.
+pub fn set_native_rt_supported(supported: bool) {
+    store_native_rt_supported(&NATIVE_RT_SUPPORTED, supported);
+}
+
 /// Whether ray-tracing traversal shaders lower to native DXIL SM 6.6
-/// `RayQuery` (`VICTORY_NATIVE_RT=1`, off by default). Part of the
-/// translation: the shader cache keys on it.
+/// `RayQuery` (`VICTORY_NATIVE_RT=1`, off by default). Always returns `false`
+/// when [`set_native_rt_supported`] recorded that the host GPU lacks DXR 1.1.
+/// Part of the translation: the shader cache keys on it.
 pub fn native_rt() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
+    let env_enabled = *ON.get_or_init(|| {
         std::env::var("VICTORY_NATIVE_RT")
             .ok()
             .as_deref()
             .map(str::trim)
             == Some("1")
-    })
+    });
+    native_rt_with(&NATIVE_RT_SUPPORTED, env_enabled)
 }
 
 /// Whether closest-hit (`accept_first_hit == false`) `AnyHit` traversal loops
@@ -474,6 +500,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out.push(rdna_wave32());
     out.push(u8::from(loop_limit_enabled()));
+    out.push(u8::from(native_rt()));
     out
 }
 
@@ -728,19 +755,26 @@ pub fn emit(
             };
             Some((p, st, io, res))
         };
-        let forms = [
-            ("without early-outs", form("without early-outs", ir::without_early_outs(p))),
-            ("without skips", form("without skips", ir::without_skips(p, false))),
-        ];
-        for (name, f) in &forms {
-            if let Some((p, st, io, res)) = f {
-                let again = emit_program(c, native, p, st, io, res);
-                report(name, &again);
-                if done(&again) {
-                    return again.map(|(shader, _, _)| shader);
-                }
+        let early_outs = form("without early-outs", ir::without_early_outs(p));
+        if let Some((p, st, io, res)) = &early_outs {
+            let again = emit_program(c, native, p, st, io, res);
+            report("without early-outs", &again);
+            if done(&again) {
+                return again.map(|(shader, _, _)| shader);
             }
         }
+        let skips = form("without skips", ir::without_skips(p, false));
+        if let Some((p, st, io, res)) = &skips {
+            let again = emit_program(c, native, p, st, io, res);
+            report("without skips", &again);
+            if done(&again) {
+                return again.map(|(shader, _, _)| shader);
+            }
+        }
+        let forms = [
+            ("without early-outs", early_outs),
+            ("without skips", skips),
+        ];
         // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
         // waves: this form puts group barriers inside branches and loops, and runs 121-124
         // lost the card in a submission of two programs that had just moved to it
@@ -884,8 +918,8 @@ pub fn emit(
                     return local.map(|(shader, _, _)| shader);
                 }
             }
-            for alt in [ir::without_early_outs(p), ir::without_skips(p, false)]
-                .into_iter()
+            for alt in std::iter::once_with(|| ir::without_early_outs(p))
+                .chain(std::iter::once_with(|| ir::without_skips(p, false)))
                 .flatten()
             {
                 let Ok(alt_st) = structure::structure(&alt) else {
@@ -987,7 +1021,8 @@ fn widen(
         _ => return Err(NOT),
     }
     let mut wide = std::collections::HashSet::new();
-    loop {
+    const MAX_WIDEN: usize = 16;
+    for iter in 0..MAX_WIDEN {
         let st = structure::structure_wide(p, &wide)?;
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
@@ -1055,8 +1090,18 @@ fn widen(
                 return r;
             }
         }
+        if iter + 1 == MAX_WIDEN {
+            if why {
+                eprintln!(
+                    "WAVE64-WIDE stopped after {MAX_WIDEN} iterations with {} branches wave-wide",
+                    wide.len()
+                );
+            }
+            return r;
+        }
         wide.extend(more);
     }
+    Err(NOT)
 }
 
 /// The translated program, the wave size it requires of the host, and whether it
@@ -3461,5 +3506,30 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    #[test]
+    fn native_rt_hardware_handshake_overrides_env() {
+        let state = AtomicU8::new(0);
+        // Unset (0): follows VICTORY_NATIVE_RT.
+        assert!(!native_rt_with(&state, false));
+        assert!(native_rt_with(&state, true));
+
+        // Unsupported (1): always false, overriding VICTORY_NATIVE_RT=1.
+        store_native_rt_supported(&state, false);
+        assert_eq!(state.load(Ordering::Relaxed), 1);
+        assert!(!native_rt_with(&state, false));
+        assert!(!native_rt_with(&state, true));
+
+        // Supported (2): still gated by VICTORY_NATIVE_RT.
+        store_native_rt_supported(&state, true);
+        assert_eq!(state.load(Ordering::Relaxed), 2);
+        assert!(!native_rt_with(&state, false));
+        assert!(native_rt_with(&state, true));
+
+        // Downgrading back to unsupported (1) overrides env again.
+        store_native_rt_supported(&state, false);
+        assert_eq!(state.load(Ordering::Relaxed), 1);
+        assert!(!native_rt_with(&state, true));
     }
 }

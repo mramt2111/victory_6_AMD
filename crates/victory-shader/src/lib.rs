@@ -24,6 +24,10 @@ pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
 };
 
+/// Bumped when translated shader output changes in a way that invalidates
+/// previously cached translations (`victory-gpu`'s `shader_cache`).
+pub const TRANSLATOR_VERSION: u32 = 2;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]

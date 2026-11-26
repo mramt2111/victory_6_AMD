@@ -92,6 +92,16 @@ impl Exit {
     }
 }
 
+/// Zero-allocation iterator over an exit's successor block indices.
+fn succs(exit: Exit) -> impl Iterator<Item = usize> {
+    let pair = match exit {
+        Exit::Jump(b) => [Some(b), None],
+        Exit::Branch { taken, not_taken } => [Some(taken), Some(not_taken)],
+        Exit::End | Exit::Indirect => [None, None],
+    };
+    pair.into_iter().flatten()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Phi {
     pub reg: Reg,
@@ -135,7 +145,8 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
     let mut flows = Vec::with_capacity(list.len());
-    let mut leaders = vec![0];
+    let mut leaders = Vec::with_capacity(list.len() / 8 + 4);
+    leaders.push(0);
     for (i, inst) in list.iter().enumerate() {
         let flow = gfx10::control(inst, code.len(), |at| {
             list[..list.partition_point(|i| i.offset < at)].last()
@@ -435,9 +446,12 @@ fn unspill(
                 i
             }
             let at = |offset: usize| list.partition_point(|i| i.offset < offset);
+            let mut seen = HashSet::new();
+            let mut work = Vec::new();
             for save in (0..list.len()).filter(|&i| parks[i].is_some_and(|p| p.0)) {
-                let mut seen = HashSet::new();
-                let mut work = vec![save + 1];
+                seen.clear();
+                work.clear();
+                work.push(save + 1);
                 while let Some(from) = work.pop() {
                     for i in from..list.len() {
                         if slot(i).is_some() && slot(i) == slot(save) {
@@ -482,9 +496,18 @@ fn unspill(
             .filter_map(|i| Some((slot(i)?, i)))
             .collect();
         stores.sort_unstable();
-        let number = |i: usize| stores.iter().position(|s| s.1 == first[i]);
+        let mut store_id = vec![usize::MAX; list.len()];
+        for (idx, &(_, rep)) in stores.iter().enumerate() {
+            store_id[rep] = idx;
+        }
         let of = (0..list.len())
-            .map(|i| parks[i].and_then(|_| number(i)).unwrap_or(usize::MAX))
+            .map(|i| {
+                if parks[i].is_some() {
+                    store_id[first[i]]
+                } else {
+                    usize::MAX
+                }
+            })
             .collect();
         (of, stores.into_iter().map(|s| s.0).collect())
     };
@@ -492,14 +515,24 @@ fn unspill(
     // none if the spare codes do not suffice.
     let plan = |split: bool| -> Option<(Vec<usize>, Vec<(usize, usize)>, Vec<u8>)> {
         let (mut of, stores) = stores_of(split);
+        let mut by_store: Vec<Vec<usize>> = vec![Vec::new(); stores.len()];
+        for (i, &o) in of.iter().enumerate() {
+            if o != usize::MAX {
+                by_store[o].push(i);
+            }
+        }
         let mut pairs: Vec<(usize, usize)> = Vec::new();
+        let mut partners: Vec<Option<usize>> = Vec::new();
+        let mut distinct: Vec<usize> = Vec::new();
         for (n, &(reg, lane)) in stores.iter().enumerate() {
             if !wave64 || pairs.iter().any(|&(_, upper)| upper == n) {
                 continue;
             }
-            let lower: Vec<usize> = (0..list.len()).filter(|&i| of[i] == n).collect();
-            let partners: Vec<Option<usize>> = lower.iter().map(|&i| partner(i)).collect();
-            let mut distinct: Vec<usize> = partners.iter().flatten().copied().collect();
+            let lower = &by_store[n];
+            partners.clear();
+            partners.extend(lower.iter().map(|&i| partner(i)));
+            distinct.clear();
+            distinct.extend(partners.iter().flatten().copied());
             distinct.sort_unstable();
             distinct.dedup();
             let Some(upper) = distinct.first().map(|&j| of[j]) else {
@@ -509,7 +542,7 @@ fn unspill(
                 && partners.iter().all(Option::is_some)
                 && distinct.len() == lower.len()
                 && distinct.iter().all(|&j| of[j] == upper)
-                && of.iter().filter(|&&o| o == upper).count() == lower.len()
+                && by_store[upper].len() == lower.len()
             {
                 pairs.push((n, upper));
             }
@@ -606,7 +639,7 @@ fn unspill(
             edits.push((i, Some((false, dst, src))));
         }
     }
-    let mut moves = Vec::new();
+    let mut moves = Vec::with_capacity(edits.len());
     for (i, edit) in edits {
         match edit {
             Some((wide, dst, src)) => {
@@ -735,20 +768,30 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
         p.blocks[b].exit == Exit::End
             && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
     };
+    let has_early_out = p.blocks.iter().any(|block| {
+        matches!(block.exit, Exit::Branch { taken, .. } if ends(taken))
+            && block
+                .insts
+                .last()
+                .is_some_and(|i| i.name() == "s_cbranch_execz")
+    });
+    if !has_early_out {
+        return None;
+    }
     let mut blocks = p.blocks.clone();
-    let mut any = false;
     for block in &mut blocks {
         let Exit::Branch { taken, not_taken } = block.exit else {
             continue;
         };
-        if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
+        if ends(taken)
+            && block
+                .insts
+                .last()
+                .is_some_and(|i| i.name() == "s_cbranch_execz")
+        {
             block.insts.pop();
             block.exit = Exit::Jump(not_taken);
-            any = true;
         }
-    }
-    if !any {
-        return None;
     }
     for block in &mut blocks {
         block.phis.clear();
@@ -785,47 +828,49 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     };
     // Scalars moved from register to register (a scalar the compiler parked in a VGPR lane
     // comes back by such a move, `unspill`) are the value they copy.
-    let mut copy: std::collections::HashMap<Value, Value> = Default::default();
+    let mut copy: HashMap<Value, Value> = HashMap::new();
     // Values something reads, directly or through joins. A scalar operation none of whose
     // results is read reads nothing either (the compiler restores EXEC from a saved mask
     // and overwrites it at once where two branches end together).
-    let mut live: std::collections::HashSet<Value> = Default::default();
-    let idle = |inst: &Inst, live: &std::collections::HashSet<Value>| {
-        let name = inst.name();
-        matches!(inst.fields, crate::gfx10::Fields::Sop { .. })
-            && !(name.starts_with("s_setpc")
-                || name.starts_with("s_swappc")
-                || name.starts_with("s_call")
-                || name.starts_with("s_rfe")
-                || name.starts_with("s_movrel")
-                || name.starts_with("s_subvector"))
-            && inst.writes.iter().all(|w| !live.contains(&w.1))
-    };
-    for block in &p.blocks {
-        for inst in &block.insts {
-            if matches!(inst.name(), "s_mov_b32" | "s_mov_b64")
-                && inst.reads.len() == inst.writes.len()
-                && inst.reads.iter().chain(&inst.writes).all(|r| matches!(r.0, Reg::S(_)))
-            {
-                copy.extend(inst.writes.iter().zip(&inst.reads).map(|(w, r)| (w.1, r.1)));
-            }
-        }
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
+    let mut live: HashSet<Value> = HashSet::new();
+    if deep {
+        let idle = |inst: &Inst, live: &HashSet<Value>| {
+            let name = inst.name();
+            matches!(inst.fields, crate::gfx10::Fields::Sop { .. })
+                && !(name.starts_with("s_setpc")
+                    || name.starts_with("s_swappc")
+                    || name.starts_with("s_call")
+                    || name.starts_with("s_rfe")
+                    || name.starts_with("s_movrel")
+                    || name.starts_with("s_subvector"))
+                && inst.writes.iter().all(|w| !live.contains(&w.1))
+        };
         for block in &p.blocks {
             for inst in &block.insts {
-                if !idle(inst, &live) {
-                    for r in &inst.reads {
-                        changed |= live.insert(r.1);
-                    }
+                if matches!(inst.name(), "s_mov_b32" | "s_mov_b64")
+                    && inst.reads.len() == inst.writes.len()
+                    && inst.reads.iter().chain(&inst.writes).all(|r| matches!(r.0, Reg::S(_)))
+                {
+                    copy.extend(inst.writes.iter().zip(&inst.reads).map(|(w, r)| (w.1, r.1)));
                 }
             }
-            for phi in &block.phis {
-                if live.contains(&phi.value) {
-                    for &a in &phi.args {
-                        changed |= live.insert(a);
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block in &p.blocks {
+                for inst in &block.insts {
+                    if !idle(inst, &live) {
+                        for r in &inst.reads {
+                            changed |= live.insert(r.1);
+                        }
+                    }
+                }
+                for phi in &block.phis {
+                    if live.contains(&phi.value) {
+                        for &a in &phi.args {
+                            changed |= live.insert(a);
+                        }
                     }
                 }
             }
@@ -837,27 +882,31 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         }
         v
     };
-    // The region a skip of `b` to `target` leaves out, if it is a pure skip.
-    let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
-        let mut inside = vec![false; n];
-        let mut stack = vec![first];
+    let mut inside = vec![false; n];
+    let mut stack = Vec::new();
+    let mut before: Vec<Value> = Vec::new();
+    // Whether a skip of `b` to `target` leaves out a pure skip region.
+    let mut is_pure_skip = |b: usize, target: usize, first: usize| -> bool {
+        inside.fill(false);
+        stack.clear();
+        stack.push(first);
         while let Some(x) = stack.pop() {
             if x == target || inside[x] {
                 continue;
             }
             if x == b {
-                return None; // a loop back to the branch
+                return false; // a loop back to the branch
             }
             inside[x] = true;
             match p.blocks[x].exit {
-                Exit::End | Exit::Indirect => return None,
-                exit => stack.extend(exit.successors()),
+                Exit::End | Exit::Indirect => return false,
+                exit => stack.extend(succs(exit)),
             }
         }
         // entered only through the branch
         for x in (0..n).filter(|&x| inside[x]) {
             if p.blocks[x].preds.iter().any(|&q| q != b && !inside[q]) {
-                return None;
+                return false;
             }
         }
         // the join sees no scalar the region changed
@@ -872,23 +921,33 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             if !scalar || deep && !live.contains(&phi.value) {
                 continue;
             }
-            let before: Vec<Value> =
-                join.preds.iter().zip(&phi.args).filter(|(q, _)| **q == b).map(|(_, a)| root(*a)).collect();
-            let within = join.preds.iter().zip(&phi.args).filter(|(q, _)| inside[**q]).map(|(_, a)| root(*a));
+            before.clear();
+            before.extend(
+                join.preds
+                    .iter()
+                    .zip(&phi.args)
+                    .filter(|(q, _)| **q == b)
+                    .map(|(_, a)| root(*a)),
+            );
+            let within = join
+                .preds
+                .iter()
+                .zip(&phi.args)
+                .filter(|(q, _)| inside[**q])
+                .map(|(_, a)| root(*a));
             if within.into_iter().any(|a| !before.contains(&a)) {
-                return None;
+                return false;
             }
         }
         // Other ways into the join than the branch and the region (an inner branch that ends
         // together with an outer one) change nothing in that: the lanes that would have
         // skipped arrive from the region instead, with the same scalars.
         if !deep && join.preds.iter().any(|&q| q != b && !inside[q]) {
-            return None;
+            return false;
         }
-        Some(inside)
+        true
     };
-    let mut blocks = p.blocks.clone();
-    let mut any = false;
+    let mut remove: Vec<(usize, usize)> = Vec::new();
     for b in 0..n {
         let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
             continue;
@@ -896,14 +955,17 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         if !p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
             continue;
         }
-        if ends(taken) || skipped(b, taken, not_taken).is_some() {
-            blocks[b].insts.pop();
-            blocks[b].exit = Exit::Jump(not_taken);
-            any = true;
+        if ends(taken) || is_pure_skip(b, taken, not_taken) {
+            remove.push((b, not_taken));
         }
     }
-    if !any {
+    if remove.is_empty() {
         return None;
+    }
+    let mut blocks = p.blocks.clone();
+    for (b, not_taken) in remove {
+        blocks[b].insts.pop();
+        blocks[b].exit = Exit::Jump(not_taken);
     }
     for block in &mut blocks {
         block.phis.clear();
@@ -947,9 +1009,20 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
 
 /// In [`Reg`] order, which is also index order.
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
-    (0..REGS)
-        .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
-        .map(reg_at)
+    let mut word_idx = 0;
+    let mut word = set[0];
+    std::iter::from_fn(move || {
+        while word == 0 {
+            word_idx += 1;
+            if word_idx >= set.len() {
+                return None;
+            }
+            word = set[word_idx];
+        }
+        let tz = word.trailing_zeros() as usize;
+        word &= word - 1;
+        Some(reg_at(word_idx * 64 + tz))
+    })
 }
 
 /// `outs` is sorted by register, and holds every register live out.
@@ -961,13 +1034,20 @@ fn lookup(outs: &[(Reg, Value)], reg: Reg) -> Value {
 pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     let mut seen = vec![false; blocks.len()];
     let mut post = Vec::with_capacity(blocks.len());
-    let mut stack = vec![(0, 0)];
+    let mut stack = Vec::with_capacity(blocks.len().min(64).max(1));
+    stack.push((0, 0));
     seen[0] = true;
     while let Some(top) = stack.last_mut() {
         let (b, i) = *top;
         top.1 += 1;
-        match blocks[b].exit.successors().get(i) {
-            Some(&s) if !seen[s] => {
+        let next = match (blocks[b].exit, i) {
+            (Exit::Jump(s), 0) => Some(s),
+            (Exit::Branch { taken, .. }, 0) => Some(taken),
+            (Exit::Branch { not_taken, .. }, 1) => Some(not_taken),
+            _ => None,
+        };
+        match next {
+            Some(s) if !seen[s] => {
                 seen[s] = true;
                 stack.push((s, 0));
             }
@@ -988,7 +1068,7 @@ fn link(blocks: &mut [Block]) {
         block.preds.clear();
     }
     for b in 0..blocks.len() {
-        for s in blocks[b].exit.successors() {
+        for s in succs(blocks[b].exit) {
             blocks[s].preds.push(b);
         }
     }
@@ -1005,7 +1085,7 @@ pub(crate) fn irreducible_edge(
     let &entry = order.first()?;
     let idom = idoms(blocks, order, index);
     for &b in order {
-        for s in blocks[b].exit.successors() {
+        for s in succs(blocks[b].exit) {
             if index[s] > index[b] {
                 continue;
             }
@@ -1086,7 +1166,7 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
                 what: "irreducible control flow",
             });
         };
-        entries.sort_by_key(|&e| index[e]);
+        entries.sort_unstable_by_key(|&e| index[e]);
         let (header, entry) = (entries[0], entries[1]);
 
         // What `entry` reaches in the loop before the header, and its copies.
@@ -1099,7 +1179,7 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
             }
             copy[b] = blocks.len() + copied.len();
             copied.push(b);
-            for s in blocks[b].exit.successors() {
+            for s in succs(blocks[b].exit) {
                 if region[s] && s != header {
                     stack.push(s);
                 }
@@ -1113,6 +1193,7 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
             }
             Exit::End | Exit::Indirect => {}
         };
+        blocks.reserve(copied.len());
         for &b in &copied {
             let mut block = blocks[b].clone();
             retarget(&mut block.exit, &|s| {
@@ -1143,15 +1224,19 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
         let mut seen = vec![false; blocks.len()];
         let mut stack = vec![from];
         while let Some(b) = stack.pop() {
-            let next = if forward {
-                blocks[b].exit.successors()
+            if forward {
+                for n in succs(blocks[b].exit) {
+                    if inside[n] && !seen[n] {
+                        seen[n] = true;
+                        stack.push(n);
+                    }
+                }
             } else {
-                blocks[b].preds.clone()
-            };
-            for n in next {
-                if inside[n] && !seen[n] {
-                    seen[n] = true;
-                    stack.push(n);
+                for &n in &blocks[b].preds {
+                    if inside[n] && !seen[n] {
+                        seen[n] = true;
+                        stack.push(n);
+                    }
                 }
             }
         }
@@ -1214,7 +1299,7 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
         changed = false;
         for &b in order.iter().rev() {
             let mut out = empty;
-            for s in blocks[b].exit.successors() {
+            for s in succs(blocks[b].exit) {
                 for (o, i) in out.iter_mut().zip(&live_in[s]) {
                     *o |= i;
                 }
@@ -1601,12 +1686,15 @@ fn effects(
     if vector {
         r.extend(mask(EXEC));
     }
-    let mut seen = Vec::with_capacity(r.len());
-    r.retain(|reg| {
-        let new = !seen.contains(reg);
-        seen.push(*reg);
-        new
-    });
+    let mut write = 0;
+    for read in 0..r.len() {
+        let reg = r[read];
+        if !r[..write].contains(&reg) {
+            r[write] = reg;
+            write += 1;
+        }
+    }
+    r.truncate(write);
     Ok(Some((r, w)))
 }
 
